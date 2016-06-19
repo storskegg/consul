@@ -25,6 +25,8 @@ func nextConfig() *Config {
 	idx := int(atomic.AddUint64(&offset, 1))
 	conf := DefaultConfig()
 
+	conf.Version = "a.b"
+	conf.VersionPrerelease = "c.d"
 	conf.AdvertiseAddr = "127.0.0.1"
 	conf.Bootstrap = true
 	conf.Datacenter = "dc1"
@@ -57,6 +59,8 @@ func nextConfig() *Config {
 	cons.RaftConfig.HeartbeatTimeout = 40 * time.Millisecond
 	cons.RaftConfig.ElectionTimeout = 40 * time.Millisecond
 
+	cons.DisableCoordinates = false
+	cons.CoordinateUpdatePeriod = 100 * time.Millisecond
 	return conf
 }
 
@@ -164,6 +168,49 @@ func TestAgent_CheckAdvertiseAddrsSettings(t *testing.T) {
 	if rpc != c.AdvertiseAddrs.RPC {
 		t.Fatalf("RPC is not properly set to %v: %s", c.AdvertiseAddrs.RPC, rpc)
 	}
+	expected := map[string]string{
+		"wan": agent.config.AdvertiseAddrWan,
+	}
+	if !reflect.DeepEqual(agent.config.TaggedAddresses, expected) {
+		t.Fatalf("Tagged addresses not set up properly: %v", agent.config.TaggedAddresses)
+	}
+}
+
+func TestAgent_ReconnectConfigSettings(t *testing.T) {
+	c := nextConfig()
+	func() {
+		dir, agent := makeAgent(t, c)
+		defer os.RemoveAll(dir)
+		defer agent.Shutdown()
+
+		lan := agent.consulConfig().SerfLANConfig.ReconnectTimeout
+		if lan != 3*24*time.Hour {
+			t.Fatalf("bad: %s", lan.String())
+		}
+
+		wan := agent.consulConfig().SerfWANConfig.ReconnectTimeout
+		if wan != 3*24*time.Hour {
+			t.Fatalf("bad: %s", wan.String())
+		}
+	}()
+
+	c.ReconnectTimeoutLan = 24 * time.Hour
+	c.ReconnectTimeoutWan = 36 * time.Hour
+	func() {
+		dir, agent := makeAgent(t, c)
+		defer os.RemoveAll(dir)
+		defer agent.Shutdown()
+
+		lan := agent.consulConfig().SerfLANConfig.ReconnectTimeout
+		if lan != 24*time.Hour {
+			t.Fatalf("bad: %s", lan.String())
+		}
+
+		wan := agent.consulConfig().SerfWANConfig.ReconnectTimeout
+		if wan != 36*time.Hour {
+			t.Fatalf("bad: %s", wan.String())
+		}
+	}()
 }
 
 func TestAgent_AddService(t *testing.T) {
@@ -872,7 +919,7 @@ func TestAgent_PersistCheck(t *testing.T) {
 		Interval: 10 * time.Second,
 	}
 
-	file := filepath.Join(agent.config.DataDir, checksDir, stringHash(check.CheckID))
+	file := filepath.Join(agent.config.DataDir, checksDir, checkIDHash(check.CheckID))
 
 	// Not persisted if not requested
 	if err := agent.AddCheck(check, chkType, false, ""); err != nil {
@@ -967,7 +1014,7 @@ func TestAgent_PurgeCheck(t *testing.T) {
 		Status:  structs.HealthPassing,
 	}
 
-	file := filepath.Join(agent.config.DataDir, checksDir, stringHash(check.CheckID))
+	file := filepath.Join(agent.config.DataDir, checksDir, checkIDHash(check.CheckID))
 	if err := agent.AddCheck(check, nil, true, ""); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -1027,7 +1074,7 @@ func TestAgent_PurgeCheckOnDuplicate(t *testing.T) {
 	}
 	defer agent2.Shutdown()
 
-	file := filepath.Join(agent.config.DataDir, checksDir, stringHash(check1.CheckID))
+	file := filepath.Join(agent.config.DataDir, checksDir, checkIDHash(check1.CheckID))
 	if _, err := os.Stat(file); err == nil {
 		t.Fatalf("should have removed persisted check")
 	}
@@ -1205,7 +1252,7 @@ func TestAgent_ServiceMaintenanceMode(t *testing.T) {
 	}
 
 	// Enter maintenance mode for the service
-	if err := agent.EnableServiceMaintenance("redis", "broken"); err != nil {
+	if err := agent.EnableServiceMaintenance("redis", "broken", "mytoken"); err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
@@ -1214,6 +1261,11 @@ func TestAgent_ServiceMaintenanceMode(t *testing.T) {
 	check, ok := agent.state.Checks()[checkID]
 	if !ok {
 		t.Fatalf("should have registered critical maintenance check")
+	}
+
+	// Check that the token was used to register the check
+	if token := agent.state.CheckToken(checkID); token != "mytoken" {
+		t.Fatalf("expected 'mytoken', got: '%s'", token)
 	}
 
 	// Ensure the reason was set in notes
@@ -1232,7 +1284,7 @@ func TestAgent_ServiceMaintenanceMode(t *testing.T) {
 	}
 
 	// Enter service maintenance mode without providing a reason
-	if err := agent.EnableServiceMaintenance("redis", ""); err != nil {
+	if err := agent.EnableServiceMaintenance("redis", "", ""); err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
@@ -1297,12 +1349,17 @@ func TestAgent_NodeMaintenanceMode(t *testing.T) {
 	defer agent.Shutdown()
 
 	// Enter maintenance mode for the node
-	agent.EnableNodeMaintenance("broken")
+	agent.EnableNodeMaintenance("broken", "mytoken")
 
 	// Make sure the critical health check was added
 	check, ok := agent.state.Checks()[nodeMaintCheckID]
 	if !ok {
 		t.Fatalf("should have registered critical node check")
+	}
+
+	// Check that the token was used to register the check
+	if token := agent.state.CheckToken(nodeMaintCheckID); token != "mytoken" {
+		t.Fatalf("expected 'mytoken', got: '%s'", token)
 	}
 
 	// Ensure the reason was set in notes
@@ -1319,7 +1376,7 @@ func TestAgent_NodeMaintenanceMode(t *testing.T) {
 	}
 
 	// Enter maintenance mode without passing a reason
-	agent.EnableNodeMaintenance("")
+	agent.EnableNodeMaintenance("", "")
 
 	// Make sure the check was registered with the default note
 	check, ok = agent.state.Checks()[nodeMaintCheckID]
@@ -1408,7 +1465,7 @@ func TestAgent_loadChecks_checkFails(t *testing.T) {
 	}
 
 	// Check to make sure the check was persisted
-	checkHash := stringHash(check.CheckID)
+	checkHash := checkIDHash(check.CheckID)
 	checkPath := filepath.Join(config.DataDir, checksDir, checkHash)
 	if _, err := os.Stat(checkPath); err != nil {
 		t.Fatalf("err: %s", err)
@@ -1566,4 +1623,25 @@ func TestAgent_purgeCheckState(t *testing.T) {
 	if _, err := os.Stat(file); !os.IsNotExist(err) {
 		t.Fatalf("should have removed file")
 	}
+}
+
+func TestAgent_GetCoordinate(t *testing.T) {
+	check := func(server bool) {
+		config := nextConfig()
+		config.Server = server
+		dir, agent := makeAgent(t, config)
+		defer os.RemoveAll(dir)
+		defer agent.Shutdown()
+
+		// This doesn't verify the returned coordinate, but it makes
+		// sure that the agent chooses the correct Serf instance,
+		// depending on how it's configured as a client or a server.
+		// If it chooses the wrong one, this will crash.
+		if _, err := agent.GetCoordinate(); err != nil {
+			t.Fatalf("err: %s", err)
+		}
+	}
+
+	check(true)
+	check(false)
 }

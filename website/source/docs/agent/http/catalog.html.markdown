@@ -20,7 +20,7 @@ The following endpoints are supported:
 * [`/v1/catalog/nodes`](#catalog_nodes) : Lists nodes in a given DC
 * [`/v1/catalog/services`](#catalog_services) : Lists services in a given DC
 * [`/v1/catalog/service/<service>`](#catalog_service) : Lists the nodes in a given service
-* [`/v1/catalog/node/<node>`](#catalog_nodes) : Lists the services provided by a node
+* [`/v1/catalog/node/<node>`](#catalog_node) : Lists the services provided by a node
 
 The `nodes` and `services` endpoints support blocking queries and
 tunable consistency modes.
@@ -48,6 +48,9 @@ body must look something like:
       "v1"
     ],
     "Address": "127.0.0.1",
+    "TaggedAddresses": {
+      "wan": "127.0.0.1"
+    },
     "Port": 8000
   },
   "Check": {
@@ -64,7 +67,9 @@ body must look something like:
 The behavior of the endpoint depends on what keys are provided. The endpoint
 requires `Node` and `Address` to be provided while `Datacenter` will be defaulted
 to match that of the agent. If only those are provided, the endpoint will register
-the node with the catalog.
+the node with the catalog. `TaggedAddresses` can be used in conjunction with the
+[`translate_wan_addrs`](/docs/agent/options.html#translate_wan_addrs) configuration
+option. Currently only the "wan" tag is supported.
 
 If the `Service` key is provided, the service will also be registered. If
 `ID` is not provided, it will be defaulted to the value of the `Service.Service` property.
@@ -159,6 +164,10 @@ If the API call succeeds a 200 status code is returned.
 This endpoint is hit with a GET and is used to return all the
 datacenters that are known by the Consul server.
 
+The datacenters will be sorted in ascending order based on the
+estimated median round trip time from the server to the servers
+in that datacenter.
+
 It returns a JSON body like this:
 
 ```javascript
@@ -175,17 +184,28 @@ This endpoint is hit with a GET and returns the nodes registered
 in a given DC. By default, the datacenter of the agent is queried;
 however, the dc can be provided using the "?dc=" query parameter.
 
+Adding the optional "?near=" parameter with a node name will sort
+the node list in ascending order based on the estimated round trip
+time from that node. Passing "?near=_agent" will use the agent's
+node for the sort.
+
 It returns a JSON body like this:
 
 ```javascript
 [
   {
     "Node": "baz",
-    "Address": "10.1.10.11"
+    "Address": "10.1.10.11",
+    "TaggedAddresses": {
+      "wan": "10.1.10.11"
+    }
   },
   {
     "Node": "foobar",
-    "Address": "10.1.10.12"
+    "Address": "10.1.10.12",
+    "TaggedAddresses": {
+      "wan": "10.1.10.12"
+    }
   }
 ]
 ```
@@ -226,6 +246,11 @@ The service being queried must be provided on the path. By default
 all nodes in that service are returned. However, the list can be filtered
 by tag using the "?tag=" query parameter.
 
+Adding the optional "?near=" parameter with a node name will sort
+the node list in ascending order based on the estimated round trip
+time from that node. Passing "?near=_agent" will use the agent's
+node for the sort.
+
 It returns a JSON body like this:
 
 ```javascript
@@ -257,7 +282,10 @@ It returns a JSON body like this:
 {
   "Node": {
     "Node": "foobar",
-    "Address": "10.1.10.12"
+    "Address": "10.1.10.12",
+    "TaggedAddresses": {
+      "wan": "10.1.10.12"
+    }
   },
   "Services": {
     "consul": {

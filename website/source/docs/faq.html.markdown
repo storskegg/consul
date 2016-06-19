@@ -6,16 +6,6 @@ sidebar_current: "docs-faq"
 
 # Frequently Asked Questions
 
-## Q: Why is virtual memory usage high?
-
-Consul makes use of [LMDB](http://symas.com/mdb/) internally for various data
-storage purposes. LMDB relies on using memory-mapping, a technique in which
-a sparse file is represented as a contiguous range of memory. Consul configures
-high limits for these file sizes and as a result relies on large chunks of
-virtual memory to be allocated. However, in practice, the limits are much larger
-than any realistic deployment of Consul would ever use, and the resident memory or
-physical memory used is much lower.
-
 ## Q: What is Checkpoint? / Does Consul call home?
 
 Consul makes use of a HashiCorp service called [Checkpoint](http://checkpoint.hashicorp.com)
@@ -45,7 +35,7 @@ See the [Atlas integration guide](/docs/guides/atlas.html) for more details.
 
 ## Q: Does Consul rely on UDP Broadcast or Multicast?
 
-Consul uses the [Serf](https://serfdom.io) gossip protocol which relies on
+Consul uses the [Serf](https://www.serfdom.io) gossip protocol which relies on
 TCP and UDP unicast. Broadcast and Multicast are rarely available in a multi-tenant
 or cloud network environment. For that reason, Consul and Serf were both
 designed to avoid any dependence on those capabilities.
@@ -69,10 +59,14 @@ the current state of the catalog can lag behind until the state is reconciled.
 
 ## Q: Are _failed_ or _left_ nodes ever removed?
 
-To prevent an accumulation of dead nodes (nodes in either _failed_ or _left_ states),
-Consul will automatically remove dead nodes out of the catalog. This process is
-called _reaping_. This is currently done on a non-configurable interval of 72 hours.
-Reaping is similar to leaving, causing all associated services to be deregistered.
+To prevent an accumulation of dead nodes (nodes in either _failed_ or _left_
+states), Consul will automatically remove dead nodes out of the catalog. This
+process is called _reaping_. This is currently done on a configurable
+interval of 72 hours.  Reaping is similar to leaving, causing all associated
+services to be deregistered.  Changing the reap interval for aesthetic
+reasons to trim the number of _failed_ or _left_ nodes is not advised (nodes
+in the _failed_ or _left_ state do not cause any additional burden on
+Consul).
 
 ## Q: Does Consul support delta updates for watchers or blocking queries?
 

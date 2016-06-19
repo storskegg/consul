@@ -2,11 +2,13 @@ package api
 
 import (
 	crand "crypto/rand"
+	"crypto/tls"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 	"time"
@@ -85,32 +87,131 @@ func TestDefaultConfig_env(t *testing.T) {
 	os.Setenv("CONSUL_HTTP_SSL_VERIFY", "0")
 	defer os.Setenv("CONSUL_HTTP_SSL_VERIFY", "")
 
-	config := DefaultConfig()
+	for i, config := range []*Config{DefaultConfig(), DefaultNonPooledConfig()} {
+		if config.Address != addr {
+			t.Errorf("expected %q to be %q", config.Address, addr)
+		}
+		if config.Token != token {
+			t.Errorf("expected %q to be %q", config.Token, token)
+		}
+		if config.HttpAuth == nil {
+			t.Fatalf("expected HttpAuth to be enabled")
+		}
+		if config.HttpAuth.Username != "username" {
+			t.Errorf("expected %q to be %q", config.HttpAuth.Username, "username")
+		}
+		if config.HttpAuth.Password != "password" {
+			t.Errorf("expected %q to be %q", config.HttpAuth.Password, "password")
+		}
+		if config.Scheme != "https" {
+			t.Errorf("expected %q to be %q", config.Scheme, "https")
+		}
+		if !config.HttpClient.Transport.(*http.Transport).TLSClientConfig.InsecureSkipVerify {
+			t.Errorf("expected SSL verification to be off")
+		}
 
-	if config.Address != addr {
-		t.Errorf("expected %q to be %q", config.Address, addr)
+		// Use keep alives as a check for whether pooling is on or off.
+		if pooled := i == 0; pooled {
+			if config.HttpClient.Transport.(*http.Transport).DisableKeepAlives != false {
+				t.Errorf("expected keep alives to be enabled")
+			}
+		} else {
+			if config.HttpClient.Transport.(*http.Transport).DisableKeepAlives != true {
+				t.Errorf("expected keep alives to be disabled")
+			}
+		}
+	}
+}
+
+func TestSetupTLSConfig(t *testing.T) {
+	// A default config should result in a clean default client config.
+	tlsConfig := &TLSConfig{}
+	cc, err := SetupTLSConfig(tlsConfig)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	expected := &tls.Config{}
+	if !reflect.DeepEqual(cc, expected) {
+		t.Fatalf("bad: %v", cc)
 	}
 
-	if config.Token != token {
-		t.Errorf("expected %q to be %q", config.Token, token)
+	// Try some address variations with and without ports.
+	tlsConfig.Address = "127.0.0.1"
+	cc, err = SetupTLSConfig(tlsConfig)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	expected.ServerName = "127.0.0.1"
+	if !reflect.DeepEqual(cc, expected) {
+		t.Fatalf("bad: %v", cc)
 	}
 
-	if config.HttpAuth == nil {
-		t.Fatalf("expected HttpAuth to be enabled")
+	tlsConfig.Address = "127.0.0.1:80"
+	cc, err = SetupTLSConfig(tlsConfig)
+	if err != nil {
+		t.Fatalf("err: %v", err)
 	}
-	if config.HttpAuth.Username != "username" {
-		t.Errorf("expected %q to be %q", config.HttpAuth.Username, "username")
-	}
-	if config.HttpAuth.Password != "password" {
-		t.Errorf("expected %q to be %q", config.HttpAuth.Password, "password")
-	}
-
-	if config.Scheme != "https" {
-		t.Errorf("expected %q to be %q", config.Scheme, "https")
+	expected.ServerName = "127.0.0.1"
+	if !reflect.DeepEqual(cc, expected) {
+		t.Fatalf("bad: %v", cc)
 	}
 
-	if !config.HttpClient.Transport.(*http.Transport).TLSClientConfig.InsecureSkipVerify {
-		t.Errorf("expected SSL verification to be off")
+	tlsConfig.Address = "demo.consul.io:80"
+	cc, err = SetupTLSConfig(tlsConfig)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	expected.ServerName = "demo.consul.io"
+	if !reflect.DeepEqual(cc, expected) {
+		t.Fatalf("bad: %v", cc)
+	}
+
+	tlsConfig.Address = "[2001:db8:a0b:12f0::1]"
+	cc, err = SetupTLSConfig(tlsConfig)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	expected.ServerName = "[2001:db8:a0b:12f0::1]"
+	if !reflect.DeepEqual(cc, expected) {
+		t.Fatalf("bad: %v", cc)
+	}
+
+	tlsConfig.Address = "[2001:db8:a0b:12f0::1]:80"
+	cc, err = SetupTLSConfig(tlsConfig)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	expected.ServerName = "2001:db8:a0b:12f0::1"
+	if !reflect.DeepEqual(cc, expected) {
+		t.Fatalf("bad: %v", cc)
+	}
+
+	// Skip verification.
+	tlsConfig.InsecureSkipVerify = true
+	cc, err = SetupTLSConfig(tlsConfig)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	expected.InsecureSkipVerify = true
+	if !reflect.DeepEqual(cc, expected) {
+		t.Fatalf("bad: %v", cc)
+	}
+
+	// Make a new config that hits all the file parsers.
+	tlsConfig = &TLSConfig{
+		CertFile: "../test/hostname/Alice.crt",
+		KeyFile:  "../test/hostname/Alice.key",
+		CAFile:   "../test/hostname/CertAuth.crt",
+	}
+	cc, err = SetupTLSConfig(tlsConfig)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(cc.Certificates) != 1 {
+		t.Fatalf("missing certificate: %v", cc.Certificates)
+	}
+	if cc.RootCAs == nil {
+		t.Fatalf("didn't load root CAs")
 	}
 }
 
@@ -127,6 +228,7 @@ func TestSetQueryOptions(t *testing.T) {
 		WaitIndex:         1000,
 		WaitTime:          100 * time.Second,
 		Token:             "12345",
+		Near:              "nodex",
 	}
 	r.setQueryOptions(q)
 
@@ -146,6 +248,9 @@ func TestSetQueryOptions(t *testing.T) {
 		t.Fatalf("bad: %v", r.params)
 	}
 	if r.params.Get("token") != "12345" {
+		t.Fatalf("bad: %v", r.params)
+	}
+	if r.params.Get("near") != "nodex" {
 		t.Fatalf("bad: %v", r.params)
 	}
 }
@@ -248,5 +353,37 @@ func TestAPI_UnixSocket(t *testing.T) {
 	}
 	if info["Config"]["NodeName"] == "" {
 		t.Fatalf("bad: %v", info)
+	}
+}
+
+func TestAPI_durToMsec(t *testing.T) {
+	if ms := durToMsec(0); ms != "0ms" {
+		t.Fatalf("bad: %s", ms)
+	}
+
+	if ms := durToMsec(time.Millisecond); ms != "1ms" {
+		t.Fatalf("bad: %s", ms)
+	}
+
+	if ms := durToMsec(time.Microsecond); ms != "1ms" {
+		t.Fatalf("bad: %s", ms)
+	}
+
+	if ms := durToMsec(5 * time.Millisecond); ms != "5ms" {
+		t.Fatalf("bad: %s", ms)
+	}
+}
+
+func TestAPI_IsServerError(t *testing.T) {
+	if IsServerError(nil) {
+		t.Fatalf("should not be a server error")
+	}
+
+	if IsServerError(fmt.Errorf("not the error you are looking for")) {
+		t.Fatalf("should not be a server error")
+	}
+
+	if !IsServerError(fmt.Errorf(serverError)) {
+		t.Fatalf("should be a server error")
 	}
 }

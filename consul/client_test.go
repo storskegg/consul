@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/consul/testutil"
+	"github.com/hashicorp/net-rpc-msgpackrpc"
 	"github.com/hashicorp/serf/serf"
 )
 
@@ -81,6 +83,11 @@ func TestClient_JoinLAN(t *testing.T) {
 	if _, err := c1.JoinLAN([]string{addr}); err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	testutil.WaitForResult(func() (bool, error) {
+		return c1.servers.NumServers() == 1, nil
+	}, func(err error) {
+		t.Fatalf("expected consul server")
+	})
 
 	// Check the members
 	testutil.WaitForResult(func() (bool, error) {
@@ -93,7 +100,7 @@ func TestClient_JoinLAN(t *testing.T) {
 
 	// Check we have a new consul
 	testutil.WaitForResult(func() (bool, error) {
-		return len(c1.consuls) == 1, nil
+		return c1.servers.NumServers() == 1, nil
 	}, func(err error) {
 		t.Fatalf("expected consul server")
 	})
@@ -189,6 +196,113 @@ func TestClient_RPC(t *testing.T) {
 	})
 }
 
+func TestClient_RPC_Pool(t *testing.T) {
+	dir1, s1 := testServer(t)
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+
+	dir2, c1 := testClient(t)
+	defer os.RemoveAll(dir2)
+	defer c1.Shutdown()
+
+	// Try to join.
+	addr := fmt.Sprintf("127.0.0.1:%d",
+		s1.config.SerfLANConfig.MemberlistConfig.BindPort)
+	if _, err := c1.JoinLAN([]string{addr}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(s1.LANMembers()) != 2 || len(c1.LANMembers()) != 2 {
+		t.Fatalf("Server has %v of %v expected members; Client has %v of %v expected members.", len(s1.LANMembers()), 2, len(c1.LANMembers()), 2)
+	}
+
+	// Blast out a bunch of RPC requests at the same time to try to get
+	// contention opening new connections.
+	var wg sync.WaitGroup
+	for i := 0; i < 150; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			var out struct{}
+			testutil.WaitForResult(func() (bool, error) {
+				err := c1.RPC("Status.Ping", struct{}{}, &out)
+				return err == nil, err
+			}, func(err error) {
+				t.Fatalf("err: %v", err)
+			})
+		}()
+	}
+
+	wg.Wait()
+}
+
+func TestClient_RPC_ConsulServerPing(t *testing.T) {
+	var servers []*Server
+	var serverDirs []string
+	const numServers = 5
+
+	for n := numServers; n > 0; n-- {
+		var bootstrap bool
+		if n == numServers {
+			bootstrap = true
+		}
+		dir, s := testServerDCBootstrap(t, "dc1", bootstrap)
+		defer os.RemoveAll(dir)
+		defer s.Shutdown()
+
+		servers = append(servers, s)
+		serverDirs = append(serverDirs, dir)
+	}
+
+	const numClients = 1
+	clientDir, c := testClient(t)
+	defer os.RemoveAll(clientDir)
+	defer c.Shutdown()
+
+	// Join all servers.
+	for _, s := range servers {
+		addr := fmt.Sprintf("127.0.0.1:%d",
+			s.config.SerfLANConfig.MemberlistConfig.BindPort)
+		if _, err := c.JoinLAN([]string{addr}); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+	}
+
+	// Sleep to allow Serf to sync, shuffle, and let the shuffle complete
+	time.Sleep(1 * time.Second)
+	c.servers.ResetRebalanceTimer()
+	time.Sleep(1 * time.Second)
+
+	if len(c.LANMembers()) != numServers+numClients {
+		t.Errorf("bad len: %d", len(c.LANMembers()))
+	}
+	for _, s := range servers {
+		if len(s.LANMembers()) != numServers+numClients {
+			t.Errorf("bad len: %d", len(s.LANMembers()))
+		}
+	}
+
+	// Ping each server in the list
+	var pingCount int
+	for range servers {
+		time.Sleep(1 * time.Second)
+		s := c.servers.FindServer()
+		ok, err := c.connPool.PingConsulServer(s)
+		if !ok {
+			t.Errorf("Unable to ping server %v: %s", s.String(), err)
+		}
+		pingCount += 1
+
+		// Artificially fail the server in order to rotate the server
+		// list
+		c.servers.NotifyFailedServer(s)
+	}
+
+	if pingCount != numServers {
+		t.Errorf("bad len: %d/%d", pingCount, numServers)
+	}
+}
+
 func TestClient_RPC_TLS(t *testing.T) {
 	dir1, conf1 := testServerConfig(t, "a.testco.internal")
 	conf1.VerifyIncoming = true
@@ -279,13 +393,13 @@ func TestClientServer_UserEvent(t *testing.T) {
 	})
 
 	// Fire the user event
-	client := rpcClient(t, s1)
+	codec := rpcClient(t, s1)
 	event := structs.EventFireRequest{
 		Name:       "foo",
 		Datacenter: "dc1",
 		Payload:    []byte("baz"),
 	}
-	if err := client.Call("Internal.EventFire", &event, nil); err != nil {
+	if err := msgpackrpc.CallWithCodec(codec, "Internal.EventFire", &event, nil); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 

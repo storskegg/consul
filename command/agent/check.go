@@ -2,17 +2,22 @@ package agent
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/armon/circbuf"
+	docker "github.com/fsouza/go-dockerclient"
 	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/types"
+	"github.com/hashicorp/go-cleanhttp"
 )
 
 const (
@@ -32,15 +37,17 @@ const (
 
 // CheckType is used to create either the CheckMonitor
 // or the CheckTTL.
-// Four types are supported: Script, HTTP, TCP and TTL
-// Script, HTTP and TCP all require Interval
+// Five types are supported: Script, HTTP, TCP, Docker and TTL
+// Script, HTTP, Docker and TCP all require Interval
 // Only one of the types needs to be provided
-//  TTL or Script/Interval or HTTP/Interval or TCP/Interval
+// TTL or Script/Interval or HTTP/Interval or TCP/Interval or Docker/Interval
 type CheckType struct {
-	Script   string
-	HTTP     string
-	TCP      string
-	Interval time.Duration
+	Script            string
+	HTTP              string
+	TCP               string
+	Interval          time.Duration
+	DockerContainerID string
+	Shell             string
 
 	Timeout time.Duration
 	TTL     time.Duration
@@ -53,7 +60,7 @@ type CheckTypes []*CheckType
 
 // Valid checks if the CheckType is valid
 func (c *CheckType) Valid() bool {
-	return c.IsTTL() || c.IsMonitor() || c.IsHTTP() || c.IsTCP()
+	return c.IsTTL() || c.IsMonitor() || c.IsHTTP() || c.IsTCP() || c.IsDocker()
 }
 
 // IsTTL checks if this is a TTL type
@@ -63,7 +70,7 @@ func (c *CheckType) IsTTL() bool {
 
 // IsMonitor checks if this is a Monitor type
 func (c *CheckType) IsMonitor() bool {
-	return c.Script != "" && c.Interval != 0
+	return c.Script != "" && c.DockerContainerID == "" && c.Interval != 0
 }
 
 // IsHTTP checks if this is a HTTP type
@@ -76,11 +83,15 @@ func (c *CheckType) IsTCP() bool {
 	return c.TCP != "" && c.Interval != 0
 }
 
+func (c *CheckType) IsDocker() bool {
+	return c.DockerContainerID != "" && c.Script != "" && c.Interval != 0
+}
+
 // CheckNotifier interface is used by the CheckMonitor
 // to notify when a check has a status update. The update
 // should take care to be idempotent.
 type CheckNotifier interface {
-	UpdateCheck(checkID, status, output string)
+	UpdateCheck(checkID types.CheckID, status, output string)
 }
 
 // CheckMonitor is used to periodically invoke a script to
@@ -88,10 +99,12 @@ type CheckNotifier interface {
 // nagios plugins and expects the output in the same format.
 type CheckMonitor struct {
 	Notify   CheckNotifier
-	CheckID  string
+	CheckID  types.CheckID
 	Script   string
 	Interval time.Duration
+	Timeout  time.Duration
 	Logger   *log.Logger
+	ReapLock *sync.RWMutex
 
 	stop     bool
 	stopCh   chan struct{}
@@ -121,7 +134,7 @@ func (c *CheckMonitor) Stop() {
 // run is invoked by a goroutine to run until Stop() is called
 func (c *CheckMonitor) run() {
 	// Get the randomized initial pause time
-	initialPauseTime := randomStagger(c.Interval)
+	initialPauseTime := lib.RandomStagger(c.Interval)
 	c.Logger.Printf("[DEBUG] agent: pausing %v before first invocation of %s", initialPauseTime, c.Script)
 	next := time.After(initialPauseTime)
 	for {
@@ -137,6 +150,12 @@ func (c *CheckMonitor) run() {
 
 // check is invoked periodically to perform the script check
 func (c *CheckMonitor) check() {
+	// Disable child process reaping so that we can get this command's
+	// return value. Note that we take the read lock here since we are
+	// waiting on a specific PID and don't need to serialize all waits.
+	c.ReapLock.RLock()
+	defer c.ReapLock.RUnlock()
+
 	// Create the command
 	cmd, err := ExecScript(c.Script)
 	if err != nil {
@@ -163,7 +182,11 @@ func (c *CheckMonitor) check() {
 		errCh <- cmd.Wait()
 	}()
 	go func() {
-		time.Sleep(30 * time.Second)
+		if c.Timeout > 0 {
+			time.Sleep(c.Timeout)
+		} else {
+			time.Sleep(30 * time.Second)
+		}
 		errCh <- fmt.Errorf("Timed out running check '%s'", c.Script)
 	}()
 	err = <-errCh
@@ -209,11 +232,14 @@ func (c *CheckMonitor) check() {
 // automatically set to critical.
 type CheckTTL struct {
 	Notify  CheckNotifier
-	CheckID string
+	CheckID types.CheckID
 	TTL     time.Duration
 	Logger  *log.Logger
 
 	timer *time.Timer
+
+	lastOutput     string
+	lastOutputLock sync.RWMutex
 
 	stop     bool
 	stopCh   chan struct{}
@@ -248,12 +274,25 @@ func (c *CheckTTL) run() {
 		case <-c.timer.C:
 			c.Logger.Printf("[WARN] agent: Check '%v' missed TTL, is now critical",
 				c.CheckID)
-			c.Notify.UpdateCheck(c.CheckID, structs.HealthCritical, "TTL expired")
+			c.Notify.UpdateCheck(c.CheckID, structs.HealthCritical, c.getExpiredOutput())
 
 		case <-c.stopCh:
 			return
 		}
 	}
+}
+
+// getExpiredOutput formats the output for the case when the TTL is expired.
+func (c *CheckTTL) getExpiredOutput() string {
+	c.lastOutputLock.RLock()
+	defer c.lastOutputLock.RUnlock()
+
+	const prefix = "TTL expired"
+	if c.lastOutput == "" {
+		return prefix
+	}
+
+	return fmt.Sprintf("%s (last output before timeout follows): %s", prefix, c.lastOutput)
 }
 
 // SetStatus is used to update the status of the check,
@@ -262,6 +301,12 @@ func (c *CheckTTL) SetStatus(status, output string) {
 	c.Logger.Printf("[DEBUG] agent: Check '%v' status is now %v",
 		c.CheckID, status)
 	c.Notify.UpdateCheck(c.CheckID, status, output)
+
+	// Store the last output so we can retain it if the TTL expires.
+	c.lastOutputLock.Lock()
+	c.lastOutput = output
+	c.lastOutputLock.Unlock()
+
 	c.timer.Reset(c.TTL)
 }
 
@@ -278,7 +323,7 @@ type persistedCheck struct {
 // expiration timestamp which is used to determine staleness on later
 // agent restarts.
 type persistedCheckState struct {
-	CheckID string
+	CheckID types.CheckID
 	Output  string
 	Status  string
 	Expires int64
@@ -292,7 +337,7 @@ type persistedCheckState struct {
 // or if the request returns an error
 type CheckHTTP struct {
 	Notify   CheckNotifier
-	CheckID  string
+	CheckID  types.CheckID
 	HTTP     string
 	Interval time.Duration
 	Timeout  time.Duration
@@ -313,13 +358,13 @@ func (c *CheckHTTP) Start() {
 	if c.httpClient == nil {
 		// Create the transport. We disable HTTP Keep-Alive's to prevent
 		// failing checks due to the keepalive interval.
-		trans := *http.DefaultTransport.(*http.Transport)
+		trans := cleanhttp.DefaultTransport()
 		trans.DisableKeepAlives = true
 
 		// Create the HTTP client.
 		c.httpClient = &http.Client{
 			Timeout:   10 * time.Second,
-			Transport: &trans,
+			Transport: trans,
 		}
 
 		// For long (>10s) interval checks the http timeout is 10s, otherwise the
@@ -350,7 +395,7 @@ func (c *CheckHTTP) Stop() {
 // run is invoked by a goroutine to run until Stop() is called
 func (c *CheckHTTP) run() {
 	// Get the randomized initial pause time
-	initialPauseTime := randomStagger(c.Interval)
+	initialPauseTime := lib.RandomStagger(c.Interval)
 	c.Logger.Printf("[DEBUG] agent: pausing %v before first HTTP request of %s", initialPauseTime, c.HTTP)
 	next := time.After(initialPauseTime)
 	for {
@@ -374,6 +419,7 @@ func (c *CheckHTTP) check() {
 	}
 
 	req.Header.Set("User-Agent", HttpUserAgent)
+	req.Header.Set("Accept", "text/plain, text/*, */*")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -383,13 +429,14 @@ func (c *CheckHTTP) check() {
 	}
 	defer resp.Body.Close()
 
-	// Format the response body
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
+	// Read the response into a circular buffer to limit the size
+	output, _ := circbuf.NewBuffer(CheckBufSize)
+	if _, err := io.Copy(output, resp.Body); err != nil {
 		c.Logger.Printf("[WARN] agent: check '%v': Get error while reading body: %s", c.CheckID, err)
-		body = []byte{}
 	}
-	result := fmt.Sprintf("HTTP GET %s: %s Output: %s", c.HTTP, resp.Status, body)
+
+	// Format the response body
+	result := fmt.Sprintf("HTTP GET %s: %s Output: %s", c.HTTP, resp.Status, output.String())
 
 	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
 		// PASSING (2xx)
@@ -416,7 +463,7 @@ func (c *CheckHTTP) check() {
 // The check is critical if the connection returns an error
 type CheckTCP struct {
 	Notify   CheckNotifier
-	CheckID  string
+	CheckID  types.CheckID
 	TCP      string
 	Interval time.Duration
 	Timeout  time.Duration
@@ -466,7 +513,7 @@ func (c *CheckTCP) Stop() {
 // run is invoked by a goroutine to run until Stop() is called
 func (c *CheckTCP) run() {
 	// Get the randomized initial pause time
-	initialPauseTime := randomStagger(c.Interval)
+	initialPauseTime := lib.RandomStagger(c.Interval)
 	c.Logger.Printf("[DEBUG] agent: pausing %v before first socket connection of %s", initialPauseTime, c.TCP)
 	next := time.After(initialPauseTime)
 	for {
@@ -491,4 +538,162 @@ func (c *CheckTCP) check() {
 	conn.Close()
 	c.Logger.Printf("[DEBUG] agent: check '%v' is passing", c.CheckID)
 	c.Notify.UpdateCheck(c.CheckID, structs.HealthPassing, fmt.Sprintf("TCP connect %s: Success", c.TCP))
+}
+
+// A custom interface since go-dockerclient doesn't have one
+// We will use this interface in our test to inject a fake client
+type DockerClient interface {
+	CreateExec(docker.CreateExecOptions) (*docker.Exec, error)
+	StartExec(string, docker.StartExecOptions) error
+	InspectExec(string) (*docker.ExecInspect, error)
+}
+
+// CheckDocker is used to periodically invoke a script to
+// determine the health of an application running inside a
+// Docker Container. We assume that the script is compatible
+// with nagios plugins and expects the output in the same format.
+type CheckDocker struct {
+	Notify            CheckNotifier
+	CheckID           types.CheckID
+	Script            string
+	DockerContainerID string
+	Shell             string
+	Interval          time.Duration
+	Logger            *log.Logger
+
+	dockerClient DockerClient
+	cmd          []string
+	stop         bool
+	stopCh       chan struct{}
+	stopLock     sync.Mutex
+}
+
+//Initializes the Docker Client
+func (c *CheckDocker) Init() error {
+	//create the docker client
+	var err error
+	c.dockerClient, err = docker.NewClientFromEnv()
+	if err != nil {
+		c.Logger.Printf("[DEBUG] Error creating the Docker client: %s", err.Error())
+		return err
+	}
+	return nil
+}
+
+// Start is used to start checks.
+// Docker Checks runs until stop is called
+func (c *CheckDocker) Start() {
+	c.stopLock.Lock()
+	defer c.stopLock.Unlock()
+
+	//figure out the shell
+	if c.Shell == "" {
+		c.Shell = shell()
+	}
+
+	c.cmd = []string{c.Shell, "-c", c.Script}
+
+	c.stop = false
+	c.stopCh = make(chan struct{})
+	go c.run()
+}
+
+// Stop is used to stop a docker check.
+func (c *CheckDocker) Stop() {
+	c.stopLock.Lock()
+	defer c.stopLock.Unlock()
+	if !c.stop {
+		c.stop = true
+		close(c.stopCh)
+	}
+}
+
+// run is invoked by a goroutine to run until Stop() is called
+func (c *CheckDocker) run() {
+	// Get the randomized initial pause time
+	initialPauseTime := lib.RandomStagger(c.Interval)
+	c.Logger.Printf("[DEBUG] agent: pausing %v before first invocation of %s -c %s in container %s", initialPauseTime, c.Shell, c.Script, c.DockerContainerID)
+	next := time.After(initialPauseTime)
+	for {
+		select {
+		case <-next:
+			c.check()
+			next = time.After(c.Interval)
+		case <-c.stopCh:
+			return
+		}
+	}
+}
+
+func (c *CheckDocker) check() {
+	//Set up the Exec since
+	execOpts := docker.CreateExecOptions{
+		AttachStdin:  false,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          false,
+		Cmd:          c.cmd,
+		Container:    c.DockerContainerID,
+	}
+	var (
+		exec *docker.Exec
+		err  error
+	)
+	if exec, err = c.dockerClient.CreateExec(execOpts); err != nil {
+		c.Logger.Printf("[DEBUG] agent: Error while creating Exec: %s", err.Error())
+		c.Notify.UpdateCheck(c.CheckID, structs.HealthCritical, fmt.Sprintf("Unable to create Exec, error: %s", err.Error()))
+		return
+	}
+
+	// Collect the output
+	output, _ := circbuf.NewBuffer(CheckBufSize)
+
+	err = c.dockerClient.StartExec(exec.ID, docker.StartExecOptions{Detach: false, Tty: false, OutputStream: output, ErrorStream: output})
+	if err != nil {
+		c.Logger.Printf("[DEBUG] Error in executing health checks: %s", err.Error())
+		c.Notify.UpdateCheck(c.CheckID, structs.HealthCritical, fmt.Sprintf("Unable to start Exec: %s", err.Error()))
+		return
+	}
+
+	// Get the output, add a message about truncation
+	outputStr := string(output.Bytes())
+	if output.TotalWritten() > output.Size() {
+		outputStr = fmt.Sprintf("Captured %d of %d bytes\n...\n%s",
+			output.Size(), output.TotalWritten(), outputStr)
+	}
+
+	c.Logger.Printf("[DEBUG] agent: check '%s' script '%s' output: %s",
+		c.CheckID, c.Script, outputStr)
+
+	execInfo, err := c.dockerClient.InspectExec(exec.ID)
+	if err != nil {
+		c.Logger.Printf("[DEBUG] Error in inspecting check result : %s", err.Error())
+		c.Notify.UpdateCheck(c.CheckID, structs.HealthCritical, fmt.Sprintf("Unable to inspect Exec: %s", err.Error()))
+		return
+	}
+
+	// Sets the status of the check to healthy if exit code is 0
+	if execInfo.ExitCode == 0 {
+		c.Notify.UpdateCheck(c.CheckID, structs.HealthPassing, outputStr)
+		return
+	}
+
+	// Set the status of the check to Warning if exit code is 1
+	if execInfo.ExitCode == 1 {
+		c.Logger.Printf("[DEBUG] Check failed with exit code: %d", execInfo.ExitCode)
+		c.Notify.UpdateCheck(c.CheckID, structs.HealthWarning, outputStr)
+		return
+	}
+
+	// Set the health as critical
+	c.Logger.Printf("[WARN] agent: Check '%v' is now critical", c.CheckID)
+	c.Notify.UpdateCheck(c.CheckID, structs.HealthCritical, outputStr)
+}
+
+func shell() string {
+	if otherShell := os.Getenv("SHELL"); otherShell != "" {
+		return otherShell
+	} else {
+		return "/bin/sh"
+	}
 }

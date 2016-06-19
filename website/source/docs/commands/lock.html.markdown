@@ -60,5 +60,25 @@ The list of available flags are:
 
 * `-token` - ACL token to use. Defaults to that of agent.
 
+* `-pass-stdin` - Pass stdin to child process.
+
+* `-try` - Attempt to acquire the lock up to the given timeout. The timeout is a
+  positive decimal number, with unit suffix, such as "500ms". Valid time units
+  are "ns", "us" (or "µs"), "ms", "s", "m", "h".
+
+* `-monitor-retry` - Retry up to this number of times if Consul returns a 500 error
+   while monitoring the lock. This allows riding out brief periods of unavailability
+   without causing leader elections, but increases the amount of time required
+   to detect a lost lock in some cases. Defaults to 3, with a 1s wait between retries.
+   Set to 0 to disable.
+
 * `-verbose` - Enables verbose output.
 
+## SHELL
+Consul lock launches its children in a shell. By default, Consul will use the shell
+defined in the environment variable `SHELL`. If `SHELL` is not defined, it will
+default to `/bin/sh`. It should be noted that not all shells terminate child
+processes when they receive `SIGTERM`. Under Ubuntu, `/bin/sh` is linked to `dash`,
+which does **not** terminate its children. In order to ensure that child processes
+are killed when the lock is lost, be sure to set the `SHELL` environment variable
+appropriately.

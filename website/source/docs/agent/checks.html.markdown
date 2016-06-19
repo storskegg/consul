@@ -15,12 +15,16 @@ service. If not associated with a service, the check monitors the health of the 
 A check is defined in a configuration file or added at runtime over the HTTP interface.  Checks
 created via the HTTP interface persist with that node.
 
-There are three different kinds of checks:
+There are five different kinds of checks:
 
 * Script + Interval - These checks depend on invoking an external application
   that performs the health check, exits with an appropriate exit code, and potentially
   generates some output. A script is paired with an invocation interval (e.g.
-  every 30 seconds). This is similar to the Nagios plugin system.
+  every 30 seconds). This is similar to the Nagios plugin system. The output of
+  a script check is limited to 4K. Output larger than this will be truncated.
+  By default, Script checks will be configured with a timeout equal to 30 seconds.
+  It is possible to configure a custom Script check timeout value by specifying the 
+  `timeout` field in the check definition.
 
 * HTTP + Interval - These checks make an HTTP `GET` request every Interval (e.g.
   every 30 seconds) to the specified URL. The status of the service depends on the HTTP response code:
@@ -29,7 +33,8 @@ There are three different kinds of checks:
   to check a simple HTTP operation. By default, HTTP checks will be configured
   with a request timeout equal to the check interval, with a max of 10 seconds.
   It is possible to configure a custom HTTP check timeout value by specifying
-  the `timeout` field in the check definition.
+  the `timeout` field in the check definition. The output of the check is
+  limited to roughly 4K. Responses larger than this will be truncated.
 
 * TCP + Interval - These checks make an TCP connection attempt every Interval
   (e.g. every 30 seconds) to the specified IP/hostname and port. The status of
@@ -53,12 +58,23 @@ There are three different kinds of checks:
   can periodically `PUT` a status update to the HTTP endpoint; if the app fails, the TTL will
   expire and the health check enters a critical state. The endpoints used to
   update health information for a given check are the
-  [pass endpoint](https://consul.io/docs/agent/http/agent.html#agent_check_pass)
-  and the [fail endpoint](https://consul.io/docs/agent/http/agent.html#agent_check_fail).
+  [pass endpoint](https://www.consul.io/docs/agent/http/agent.html#agent_check_pass)
+  and the [fail endpoint](https://www.consul.io/docs/agent/http/agent.html#agent_check_fail).
   TTL checks also persist
   their last known status to disk. This allows the Consul agent to restore the
   last known status of the check across restarts. Persisted check status is
   valid through the end of the TTL from the time of the last check.
+
+* Docker + Interval - These checks depend on invoking an external application which 
+is packaged within a Docker Container. The application is triggered within the running 
+container via the Docker Exec API. We expect that the Consul agent user has access 
+to either the Docker HTTP API or the unix socket. Consul uses ```$DOCKER_HOST``` to 
+determine the Docker API endpoint. The application is expected to run, perform a health 
+check of the service running inside the container, and exit with an appropriate exit code. 
+The check should be paired with an invocation interval. The shell on which the check 
+has to be performed is configurable which makes it possible to run containers which 
+have different shells on the same host. Check output for Docker is limited to
+4K. Any output larger than this will be truncated.
 
 ## Check Definition
 
@@ -70,7 +86,8 @@ A script check:
     "id": "mem-util",
     "name": "Memory utilization",
     "script": "/usr/local/bin/check_mem.py",
-    "interval": "10s"
+    "interval": "10s",
+    "timeout": "1s"
   }
 }
 ```
@@ -116,6 +133,21 @@ A TTL check:
 }
 ```
 
+A Docker check:
+
+```javascript
+{
+"check": {
+    "id": "mem-util",
+    "name": "Memory utilization",
+    "docker_container_id": "f972c95ebf0e",
+    "shell": "/bin/bash",
+    "script": "/usr/local/bin/check_mem.py",
+    "interval": "10s"
+  }
+}
+```
+
 Each type of definition must include a `name` and may optionally
 provide an `id` and `notes` field. The `id` is set to the `name` if not
 provided. It is required that all checks have a unique ID per node: if names
@@ -130,9 +162,9 @@ Checks may also contain a `token` field to provide an ACL token. This token is
 used for any interaction with the catalog for the check, including
 [anti-entropy syncs](/docs/internals/anti-entropy.html) and deregistration.
 
-Script, TCP and HTTP checks must include an `interval` field. This field is
+Script, TCP, Docker and HTTP checks must include an `interval` field. This field is
 parsed by Go's `time` package, and has the following
-[formatting specification](http://golang.org/pkg/time/#ParseDuration):
+[formatting specification](https://golang.org/pkg/time/#ParseDuration):
 > A duration string is a possibly signed sequence of decimal numbers, each with
 > optional fraction and a unit suffix, such as "300ms", "-1.5h" or "2h45m".
 > Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".

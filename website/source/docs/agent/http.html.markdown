@@ -14,17 +14,19 @@ to enable changes without breaking backwards compatibility.
 
 Each endpoint manages a different aspect of Consul:
 
-* [kv](http/kv.html) - Key/Value store
-* [agent](http/agent.html) - Consul Agent
-* [catalog](http/catalog.html) - Nodes and services
-* [health](http/health.html) - Health checks
-* [session](http/session.html) - Sessions
 * [acl](http/acl.html) - Access Control Lists
+* [agent](http/agent.html) - Consul Agent
+* [catalog](http/catalog.html) - Nodes and Services
+* [coordinate](http/coordinate.html) - Network Coordinates
 * [event](http/event.html) - User Events
-* [status](http/status.html) - Consul system status
-* internal - Internal APIs. Purposely undocumented, subject to change.
+* [health](http/health.html) - Health Checks
+* [kv](http/kv.html) - Key/Value Store
+* [query](http/query.html) - Prepared Queries
+* [session](http/session.html) - Sessions
+* [status](http/status.html) - Consul System Status
 
-Each of these is documented in detail at the links above.
+Each of these is documented in detail at the links above. Consul also has a number
+of internal APIs which are purposely undocumented and subject to change.
 
 ## Blocking Queries
 
@@ -47,7 +49,7 @@ A critical note is that the return of a blocking request is **no guarantee** of 
 is possible that the timeout was reached or that there was an idempotent write that does
 not affect the result of the query.
 
-## Consistency Modes
+## <a id="consistency"></a>Consistency Modes
 
 Most of the read query endpoints support multiple levels of consistency. Since no policy will
 suit all clients' needs, these consistency modes allow the user to have the ultimate say in
@@ -91,5 +93,6 @@ on the query string, formatted JSON will be returned.
 Several endpoints in Consul use or require ACL tokens to operate. An agent
 can be configured to use a default token in requests using the `acl_token`
 configuration option. However, the token can also be specified per-request
-by using the `token` query parameter. This will take precedent over the
-default token.
+by using the `X-Consul-Token` request header or the `token` querystring
+parameter. The request header takes precedence over the default token, and
+the querystring parameter takes precedence over everything.

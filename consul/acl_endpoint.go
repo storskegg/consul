@@ -7,6 +7,7 @@ import (
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/go-uuid"
 )
 
 // ACL endpoint is used to manipulate ACLs
@@ -62,7 +63,11 @@ func (a *ACL) Apply(args *structs.ACLRequest, reply *string) error {
 		if args.ACL.ID == "" {
 			state := a.srv.fsm.State()
 			for {
-				args.ACL.ID = generateUUID()
+				if args.ACL.ID, err = uuid.GenerateUUID(); err != nil {
+					a.srv.logger.Printf("[ERR] consul.acl: UUID generation failed: %v", err)
+					return err
+				}
+
 				_, acl, err := state.ACLGet(args.ACL.ID)
 				if err != nil {
 					a.srv.logger.Printf("[ERR] consul.acl: ACL lookup failed: %v", err)
@@ -123,16 +128,20 @@ func (a *ACL) Get(args *structs.ACLSpecificRequest,
 	state := a.srv.fsm.State()
 	return a.srv.blockingRPC(&args.QueryOptions,
 		&reply.QueryMeta,
-		state.QueryTables("ACLGet"),
+		state.GetQueryWatch("ACLGet"),
 		func() error {
 			index, acl, err := state.ACLGet(args.ACL)
+			if err != nil {
+				return err
+			}
+
 			reply.Index = index
 			if acl != nil {
 				reply.ACLs = structs.ACLs{acl}
 			} else {
 				reply.ACLs = nil
 			}
-			return err
+			return nil
 		})
 }
 
@@ -194,10 +203,14 @@ func (a *ACL) List(args *structs.DCSpecificRequest,
 	state := a.srv.fsm.State()
 	return a.srv.blockingRPC(&args.QueryOptions,
 		&reply.QueryMeta,
-		state.QueryTables("ACLList"),
+		state.GetQueryWatch("ACLList"),
 		func() error {
-			var err error
-			reply.Index, reply.ACLs, err = state.ACLList()
-			return err
+			index, acls, err := state.ACLList()
+			if err != nil {
+				return err
+			}
+
+			reply.Index, reply.ACLs = index, acls
+			return nil
 		})
 }

@@ -24,16 +24,6 @@ func TestAEScale(t *testing.T) {
 	}
 }
 
-func TestRandomStagger(t *testing.T) {
-	intv := time.Minute
-	for i := 0; i < 10; i++ {
-		stagger := randomStagger(intv)
-		if stagger < 0 || stagger >= intv {
-			t.Fatalf("Bad: %v", stagger)
-		}
-	}
-}
-
 func TestStringHash(t *testing.T) {
 	in := "hello world"
 	expected := "5eb63bbbe01eeed093cb22bb8f5acdc3"

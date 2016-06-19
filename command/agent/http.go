@@ -41,7 +41,7 @@ type HTTPServer struct {
 
 // NewHTTPServers starts new HTTP servers to provide an interface to
 // the agent.
-func NewHTTPServers(agent *Agent, config *Config, scada net.Listener, logOutput io.Writer) ([]*HTTPServer, error) {
+func NewHTTPServers(agent *Agent, config *Config, logOutput io.Writer) ([]*HTTPServer, error) {
 	var servers []*HTTPServer
 
 	if config.Ports.HTTPS > 0 {
@@ -142,27 +142,28 @@ func NewHTTPServers(agent *Agent, config *Config, scada net.Listener, logOutput 
 		servers = append(servers, srv)
 	}
 
-	if scada != nil {
-		// Create the mux
-		mux := http.NewServeMux()
-
-		// Create the server
-		srv := &HTTPServer{
-			agent:    agent,
-			mux:      mux,
-			listener: scada,
-			logger:   log.New(logOutput, "", log.LstdFlags),
-			uiDir:    config.UiDir,
-			addr:     scadaHTTPAddr,
-		}
-		srv.registerHandlers(false) // Never allow debug for SCADA
-
-		// Start the server
-		go http.Serve(scada, mux)
-		servers = append(servers, srv)
-	}
-
 	return servers, nil
+}
+
+// newScadaHttp creates a new HTTP server wrapping the SCADA
+// listener such that HTTP calls can be sent from the brokers.
+func newScadaHttp(agent *Agent, list net.Listener) *HTTPServer {
+	// Create the mux
+	mux := http.NewServeMux()
+
+	// Create the server
+	srv := &HTTPServer{
+		agent:    agent,
+		mux:      mux,
+		listener: list,
+		logger:   agent.logger,
+		addr:     scadaHTTPAddr,
+	}
+	srv.registerHandlers(false) // Never allow debug for SCADA
+
+	// Start the server
+	go http.Serve(list, mux)
+	return srv
 }
 
 // tcpKeepAliveListener sets TCP keep-alive timeouts on accepted
@@ -205,6 +206,14 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 	s.mux.HandleFunc("/v1/catalog/service/", s.wrap(s.CatalogServiceNodes))
 	s.mux.HandleFunc("/v1/catalog/node/", s.wrap(s.CatalogNodeServices))
 
+	if !s.agent.config.DisableCoordinates {
+		s.mux.HandleFunc("/v1/coordinate/datacenters", s.wrap(s.CoordinateDatacenters))
+		s.mux.HandleFunc("/v1/coordinate/nodes", s.wrap(s.CoordinateNodes))
+	} else {
+		s.mux.HandleFunc("/v1/coordinate/datacenters", s.wrap(coordinateDisabled))
+		s.mux.HandleFunc("/v1/coordinate/nodes", s.wrap(coordinateDisabled))
+	}
+
 	s.mux.HandleFunc("/v1/health/node/", s.wrap(s.HealthNodeChecks))
 	s.mux.HandleFunc("/v1/health/checks/", s.wrap(s.HealthServiceChecks))
 	s.mux.HandleFunc("/v1/health/state/", s.wrap(s.HealthChecksInState))
@@ -223,6 +232,7 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 	s.mux.HandleFunc("/v1/agent/check/pass/", s.wrap(s.AgentCheckPass))
 	s.mux.HandleFunc("/v1/agent/check/warn/", s.wrap(s.AgentCheckWarn))
 	s.mux.HandleFunc("/v1/agent/check/fail/", s.wrap(s.AgentCheckFail))
+	s.mux.HandleFunc("/v1/agent/check/update/", s.wrap(s.AgentCheckUpdate))
 
 	s.mux.HandleFunc("/v1/agent/service/register", s.wrap(s.AgentRegisterService))
 	s.mux.HandleFunc("/v1/agent/service/deregister/", s.wrap(s.AgentDeregisterService))
@@ -256,6 +266,11 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 		s.mux.HandleFunc("/v1/acl/list", s.wrap(aclDisabled))
 	}
 
+	s.mux.HandleFunc("/v1/query", s.wrap(s.PreparedQueryGeneral))
+	s.mux.HandleFunc("/v1/query/", s.wrap(s.PreparedQuerySpecific))
+
+	s.mux.HandleFunc("/v1/txn", s.wrap(s.Txn))
+
 	if enableDebug {
 		s.mux.HandleFunc("/debug/pprof/", pprof.Index)
 		s.mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
@@ -263,19 +278,17 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 		s.mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	}
 
-	// Enable the UI + special endpoints
+	// Use the custom UI dir if provided.
 	if s.uiDir != "" {
-		// Static file serving done from /ui/
 		s.mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir(s.uiDir))))
+	} else if s.agent.config.EnableUi {
+		s.mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(assetFS())))
 	}
 
-	// Enable the special endpoints for UI or SCADA
-	if s.uiDir != "" || s.agent.config.AtlasInfrastructure != "" {
-		// API's are under /internal/ui/ to avoid conflict
-		s.mux.HandleFunc("/v1/internal/ui/nodes", s.wrap(s.UINodes))
-		s.mux.HandleFunc("/v1/internal/ui/node/", s.wrap(s.UINodeInfo))
-		s.mux.HandleFunc("/v1/internal/ui/services", s.wrap(s.UIServices))
-	}
+	// API's are under /internal/ui/ to avoid conflict
+	s.mux.HandleFunc("/v1/internal/ui/nodes", s.wrap(s.UINodes))
+	s.mux.HandleFunc("/v1/internal/ui/node/", s.wrap(s.UINodeInfo))
+	s.mux.HandleFunc("/v1/internal/ui/services", s.wrap(s.UIServices))
 }
 
 // wrap is used to wrap functions to make them more convenient
@@ -286,8 +299,8 @@ func (s *HTTPServer) wrap(handler func(resp http.ResponseWriter, req *http.Reque
 		// Obfuscate any tokens from appearing in the logs
 		formVals, err := url.ParseQuery(req.URL.RawQuery)
 		if err != nil {
-			s.logger.Printf("[ERR] http: Failed to decode query: %s", err)
-			resp.WriteHeader(500)
+			s.logger.Printf("[ERR] http: Failed to decode query: %s from=%s", err, req.RemoteAddr)
+			resp.WriteHeader(http.StatusInternalServerError) // 500
 			return
 		}
 		logURL := req.URL.String()
@@ -301,42 +314,43 @@ func (s *HTTPServer) wrap(handler func(resp http.ResponseWriter, req *http.Reque
 			}
 		}
 
+		// TODO (slackpad) We may want to consider redacting prepared
+		// query names/IDs here since they are proxies for tokens. But,
+		// knowing one only gives you read access to service listings
+		// which is pretty trivial, so it's probably not worth the code
+		// complexity and overhead of filtering them out. You can't
+		// recover the token it's a proxy for with just the query info;
+		// you'd need the actual token (or a management token) to read
+		// that back.
+
 		// Invoke the handler
 		start := time.Now()
 		defer func() {
-			s.logger.Printf("[DEBUG] http: Request %v (%v)", logURL, time.Now().Sub(start))
+			s.logger.Printf("[DEBUG] http: Request %s %v (%v) from=%s", req.Method, logURL, time.Now().Sub(start), req.RemoteAddr)
 		}()
 		obj, err := handler(resp, req)
 
 		// Check for an error
 	HAS_ERR:
 		if err != nil {
-			s.logger.Printf("[ERR] http: Request %v, error: %v", logURL, err)
-			code := 500
+			s.logger.Printf("[ERR] http: Request %s %v, error: %v from=%s", req.Method, logURL, err, req.RemoteAddr)
+			code := http.StatusInternalServerError // 500
 			errMsg := err.Error()
 			if strings.Contains(errMsg, "Permission denied") || strings.Contains(errMsg, "ACL not found") {
-				code = 403
+				code = http.StatusForbidden // 403
 			}
 			resp.WriteHeader(code)
 			resp.Write([]byte(err.Error()))
 			return
 		}
 
-		prettyPrint := false
-		if _, ok := req.URL.Query()["pretty"]; ok {
-			prettyPrint = true
-		}
-		// Write out the JSON object
 		if obj != nil {
 			var buf []byte
-			if prettyPrint {
-				buf, err = json.MarshalIndent(obj, "", "    ")
-			} else {
-				buf, err = json.Marshal(obj)
-			}
+			buf, err = s.marshalJSON(req, obj)
 			if err != nil {
 				goto HAS_ERR
 			}
+
 			resp.Header().Set("Content-Type", "application/json")
 			resp.Write(buf)
 		}
@@ -344,22 +358,47 @@ func (s *HTTPServer) wrap(handler func(resp http.ResponseWriter, req *http.Reque
 	return f
 }
 
+// marshalJSON marshals the object into JSON, respecting the user's pretty-ness
+// configuration.
+func (s *HTTPServer) marshalJSON(req *http.Request, obj interface{}) ([]byte, error) {
+	if _, ok := req.URL.Query()["pretty"]; ok {
+		buf, err := json.MarshalIndent(obj, "", "    ")
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf, "\n"...)
+		return buf, nil
+	}
+
+	buf, err := json.Marshal(obj)
+	if err != nil {
+		return nil, err
+	}
+	return buf, err
+}
+
+// Returns true if the UI is enabled.
+func (s *HTTPServer) IsUIEnabled() bool {
+	return s.uiDir != "" || s.agent.config.EnableUi
+}
+
 // Renders a simple index page
 func (s *HTTPServer) Index(resp http.ResponseWriter, req *http.Request) {
 	// Check if this is a non-index path
 	if req.URL.Path != "/" {
-		resp.WriteHeader(404)
+		resp.WriteHeader(http.StatusNotFound) // 404
 		return
 	}
 
-	// Check if we have no UI configured
-	if s.uiDir == "" {
+	// Give them something helpful if there's no UI so they at least know
+	// what this server is.
+	if !s.IsUIEnabled() {
 		resp.Write([]byte("Consul Agent"))
 		return
 	}
 
 	// Redirect to the UI endpoint
-	http.Redirect(resp, req, "/ui/", 301)
+	http.Redirect(resp, req, "/ui/", http.StatusMovedPermanently) // 301
 }
 
 // decodeBody is used to decode a JSON request body
@@ -420,7 +459,7 @@ func parseWait(resp http.ResponseWriter, req *http.Request, b *structs.QueryOpti
 	if wait := query.Get("wait"); wait != "" {
 		dur, err := time.ParseDuration(wait)
 		if err != nil {
-			resp.WriteHeader(400)
+			resp.WriteHeader(http.StatusBadRequest) // 400
 			resp.Write([]byte("Invalid wait time"))
 			return true
 		}
@@ -429,7 +468,7 @@ func parseWait(resp http.ResponseWriter, req *http.Request, b *structs.QueryOpti
 	if idx := query.Get("index"); idx != "" {
 		index, err := strconv.ParseUint(idx, 10, 64)
 		if err != nil {
-			resp.WriteHeader(400)
+			resp.WriteHeader(http.StatusBadRequest) // 400
 			resp.Write([]byte("Invalid index"))
 			return true
 		}
@@ -449,7 +488,7 @@ func parseConsistency(resp http.ResponseWriter, req *http.Request, b *structs.Qu
 		b.RequireConsistent = true
 	}
 	if b.AllowStale && b.RequireConsistent {
-		resp.WriteHeader(400)
+		resp.WriteHeader(http.StatusBadRequest) // 400
 		resp.Write([]byte("Cannot specify ?stale with ?consistent, conflicting semantics."))
 		return true
 	}
@@ -465,9 +504,14 @@ func (s *HTTPServer) parseDC(req *http.Request, dc *string) {
 	}
 }
 
-// parseToken is used to parse the ?token query param
+// parseToken is used to parse the ?token query param or the X-Consul-Token header
 func (s *HTTPServer) parseToken(req *http.Request, token *string) {
 	if other := req.URL.Query().Get("token"); other != "" {
+		*token = other
+		return
+	}
+
+	if other := req.Header.Get("X-Consul-Token"); other != "" {
 		*token = other
 		return
 	}
@@ -480,6 +524,20 @@ func (s *HTTPServer) parseToken(req *http.Request, token *string) {
 
 	// Set the default ACLToken
 	*token = s.agent.config.ACLToken
+}
+
+// parseSource is used to parse the ?near=<node> query parameter, used for
+// sorting by RTT based on a source node. We set the source's DC to the target
+// DC in the request, if given, or else the agent's DC.
+func (s *HTTPServer) parseSource(req *http.Request, source *structs.QuerySource) {
+	s.parseDC(req, &source.Datacenter)
+	if node := req.URL.Query().Get("near"); node != "" {
+		if node == "_agent" {
+			source.Node = s.agent.config.NodeName
+		} else {
+			source.Node = node
+		}
+	}
 }
 
 // parse is a convenience method for endpoints that need

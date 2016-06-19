@@ -20,6 +20,7 @@ import (
 
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/consul/testutil"
+	"github.com/hashicorp/go-cleanhttp"
 )
 
 func makeHTTPServer(t *testing.T) (string, *HTTPServer) {
@@ -27,19 +28,20 @@ func makeHTTPServer(t *testing.T) (string, *HTTPServer) {
 }
 
 func makeHTTPServerWithConfig(t *testing.T, cb func(c *Config)) (string, *HTTPServer) {
+	configTry := 0
+RECONF:
+	configTry += 1
 	conf := nextConfig()
 	if cb != nil {
 		cb(conf)
 	}
 
 	dir, agent := makeAgent(t, conf)
-	uiDir := filepath.Join(dir, "ui")
-	if err := os.Mkdir(uiDir, 755); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	conf.UiDir = uiDir
-	servers, err := NewHTTPServers(agent, conf, nil, agent.logOutput)
+	servers, err := NewHTTPServers(agent, conf, agent.logOutput)
 	if err != nil {
+		if configTry < 3 {
+			goto RECONF
+		}
 		t.Fatalf("err: %v", err)
 	}
 	if len(servers) == 0 {
@@ -95,12 +97,12 @@ func TestHTTPServer_UnixSocket(t *testing.T) {
 
 	// Ensure we can get a response from the socket.
 	path, _ := unixSocketAddr(srv.agent.config.Addresses.HTTP)
+	trans := cleanhttp.DefaultTransport()
+	trans.Dial = func(_, _ string) (net.Conn, error) {
+		return net.Dial("unix", path)
+	}
 	client := &http.Client{
-		Transport: &http.Transport{
-			Dial: func(_, _ string) (net.Conn, error) {
-				return net.Dial("unix", path)
-			},
-		},
+		Transport: trans,
 	}
 
 	// This URL doesn't look like it makes sense, but the scheme (http://) and
@@ -148,7 +150,7 @@ func TestHTTPServer_UnixSocket_FileExists(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	// Try to start the server with the same path anyways.
-	if _, err := NewHTTPServers(agent, conf, nil, agent.logOutput); err != nil {
+	if _, err := NewHTTPServers(agent, conf, agent.logOutput); err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
@@ -326,6 +328,7 @@ func testPrettyPrint(pretty string, t *testing.T) {
 	srv.wrap(handler)(resp, req)
 
 	expected, _ := json.MarshalIndent(r, "", "    ")
+	expected = append(expected, "\n"...)
 	actual, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("err: %s", err)
@@ -333,6 +336,63 @@ func testPrettyPrint(pretty string, t *testing.T) {
 
 	if !bytes.Equal(expected, actual) {
 		t.Fatalf("bad: %q", string(actual))
+	}
+}
+
+func TestParseSource(t *testing.T) {
+	dir, srv := makeHTTPServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.Shutdown()
+	defer srv.agent.Shutdown()
+
+	// Default is agent's DC and no node (since the user didn't care, then
+	// just give them the cheapest possible query).
+	req, err := http.NewRequest("GET",
+		"/v1/catalog/nodes", nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	source := structs.QuerySource{}
+	srv.parseSource(req, &source)
+	if source.Datacenter != "dc1" || source.Node != "" {
+		t.Fatalf("bad: %v", source)
+	}
+
+	// Adding the source parameter should set that node.
+	req, err = http.NewRequest("GET",
+		"/v1/catalog/nodes?near=bob", nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	source = structs.QuerySource{}
+	srv.parseSource(req, &source)
+	if source.Datacenter != "dc1" || source.Node != "bob" {
+		t.Fatalf("bad: %v", source)
+	}
+
+	// We should follow whatever dc parameter was given so that the node is
+	// looked up correctly on the receiving end.
+	req, err = http.NewRequest("GET",
+		"/v1/catalog/nodes?near=bob&dc=foo", nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	source = structs.QuerySource{}
+	srv.parseSource(req, &source)
+	if source.Datacenter != "foo" || source.Node != "bob" {
+		t.Fatalf("bad: %v", source)
+	}
+
+	// The magic "_agent" node name will use the agent's local node name.
+	req, err = http.NewRequest("GET",
+		"/v1/catalog/nodes?near=_agent", nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	source = structs.QuerySource{}
+	srv.parseSource(req, &source)
+	if source.Datacenter != "dc1" || source.Node != srv.agent.config.NodeName {
+		t.Fatalf("bad: %v", source)
 	}
 }
 
@@ -472,6 +532,22 @@ func TestACLResolution(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
+	// Request with header token only
+	reqHeaderToken, err := http.NewRequest("GET",
+		"/v1/catalog/nodes", nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	reqHeaderToken.Header.Add("X-Consul-Token", "bar")
+
+	// Request with header and querystring tokens
+	reqBothTokens, err := http.NewRequest("GET",
+		"/v1/catalog/nodes?token=baz", nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	reqBothTokens.Header.Add("X-Consul-Token", "zap")
+
 	httpTest(t, func(srv *HTTPServer) {
 		// Check when no token is set
 		srv.agent.config.ACLToken = ""
@@ -513,6 +589,71 @@ func TestACLResolution(t *testing.T) {
 		if token != "foo" {
 			t.Fatalf("bad: %s", token)
 		}
+
+		// Header token has precedence over agent token
+		srv.parseToken(reqHeaderToken, &token)
+		if token != "bar" {
+			t.Fatalf("bad: %s", token)
+		}
+
+		// Querystring token has precedence over header and agent tokens
+		srv.parseToken(reqBothTokens, &token)
+		if token != "baz" {
+			t.Fatalf("bad: %s", token)
+		}
+	})
+}
+
+func TestScadaHTTP(t *testing.T) {
+	// Create the agent
+	dir, agent := makeAgent(t, nextConfig())
+	defer os.RemoveAll(dir)
+	defer agent.Shutdown()
+
+	// Create a generic listener
+	list, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	defer list.Close()
+
+	// Create the SCADA HTTP server
+	scadaHttp := newScadaHttp(agent, list)
+
+	// Returned server uses the listener and scada addr
+	if scadaHttp.listener != list {
+		t.Fatalf("bad listener: %#v", scadaHttp)
+	}
+	if scadaHttp.addr != scadaHTTPAddr {
+		t.Fatalf("expected %v, got: %v", scadaHttp.addr, scadaHTTPAddr)
+	}
+
+	// Check that debug endpoints were not enabled. This will cause
+	// the serve mux to panic if the routes are already handled.
+	mockFn := func(w http.ResponseWriter, r *http.Request) {}
+	scadaHttp.mux.HandleFunc("/debug/pprof/", mockFn)
+	scadaHttp.mux.HandleFunc("/debug/pprof/cmdline", mockFn)
+	scadaHttp.mux.HandleFunc("/debug/pprof/profile", mockFn)
+	scadaHttp.mux.HandleFunc("/debug/pprof/symbol", mockFn)
+}
+
+func TestEnableWebUI(t *testing.T) {
+	httpTestWithConfig(t, func(s *HTTPServer) {
+		req, err := http.NewRequest("GET", "/ui/", nil)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		// Perform the request
+		resp := httptest.NewRecorder()
+		s.mux.ServeHTTP(resp, req)
+
+		// Check the result
+		if resp.Code != 200 {
+			t.Fatalf("should handle ui")
+		}
+	}, func(c *Config) {
+		c.EnableUi = true
 	})
 }
 

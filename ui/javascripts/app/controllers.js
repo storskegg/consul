@@ -9,40 +9,30 @@ App.DcController = Ember.Controller.extend({
   // Whether or not the dropdown menu can be seen
   isDropdownVisible: false,
 
-  datacenter: function() {
-    return this.get('content');
-  }.property('content'),
-
-  checks: function() {
-    var nodes = this.get('nodes');
-    var checks = Ember.A();
-
-    // Combine the checks from all of our nodes
-    // into one.
-    nodes.forEach(function(item) {
-      checks = checks.concat(item.Checks);
-    });
-
-    return checks;
-  }.property('nodes'),
+  datacenter: Ember.computed.alias('content'),
 
   // Returns the total number of failing checks.
   //
   // We treat any non-passing checks as failing
   //
   totalChecksFailing: function() {
-    var checks = this.get('checks');
-    return (checks.filterBy('Status', 'critical').get('length') +
-      checks.filterBy('Status', 'warning').get('length'));
+    return this.get('nodes').reduce(function(sum, node) {
+      return sum + node.get('failingChecks');
+    }, 0);
+  }.property('nodes'),
+
+  totalChecksPassing: function() {
+    return this.get('nodes').reduce(function(sum, node) {
+      return sum + node.get('passingChecks');
+    }, 0);
   }.property('nodes'),
 
   //
   // Returns the human formatted message for the button state
   //
   checkMessage: function() {
-    var checks = this.get('checks');
     var failingChecks = this.get('totalChecksFailing');
-    var passingChecks = checks.filterBy('Status', 'passing').get('length');
+    var passingChecks = this.get('totalChecksPassing');
 
     if (this.get('hasFailingChecks') === true) {
       return  failingChecks + ' failing';
@@ -67,10 +57,7 @@ App.DcController = Ember.Controller.extend({
   //
   // Boolean if the datacenter has any failing checks.
   //
-  hasFailingChecks: function() {
-    var failingChecks = this.get('totalChecksFailing');
-    return (failingChecks > 0);
-  }.property('nodes'),
+  hasFailingChecks: Ember.computed.gt('totalChecksFailing', 0),
 
   actions: {
     // Hide and show the dropdown menu
@@ -89,7 +76,7 @@ KvBaseController = Ember.ObjectController.extend({
     if (this.get('isRoot')) {
       return this.get('rootKey');
     }
-    return this.get("parentKey");
+    return this.get('parentKey');
   },
 
   transitionToNearestParent: function(parent) {
@@ -99,7 +86,7 @@ KvBaseController = Ember.ObjectController.extend({
     var token = App.get('settings.token');
 
     Ember.$.ajax({
-      url: (formatUrl('/v1/kv/' + parent + '?keys', dc, token)),
+      url: (formatUrl(consulHost + '/v1/kv/' + parent + '?keys', dc, token)),
       type: 'GET'
     }).then(function(data) {
       controller.transitionToRoute('kv.show', parent);
@@ -113,10 +100,7 @@ KvBaseController = Ember.ObjectController.extend({
   }
 });
 
-// Add mixins
-App.KvShowController = KvBaseController.extend(Ember.Validations.Mixin);
-
-App.KvShowController.reopen({
+App.KvShowController = KvBaseController.extend(Ember.Validations.Mixin, {
   needs: ["dc"],
   dc: Ember.computed.alias("controllers.dc"),
   isLoading: false,
@@ -143,7 +127,7 @@ App.KvShowController.reopen({
 
       // Put the Key and the Value retrieved from the form
       Ember.$.ajax({
-          url: (formatUrl("/v1/kv/" + newKey.get('Key'), dc, token)),
+          url: (formatUrl(consulHost + "/v1/kv/" + newKey.get('Key'), dc, token)),
           type: 'PUT',
           data: newKey.get('Value')
       }).then(function(response) {
@@ -171,7 +155,7 @@ App.KvShowController.reopen({
       if (window.confirm("Are you sure you want to delete this folder?")) {
         // Delete the folder
         Ember.$.ajax({
-            url: (formatUrl("/v1/kv/" + controller.get('parentKey') + '?recurse', dc, token)),
+            url: (formatUrl(consulHost + "/v1/kv/" + controller.get('parentKey') + '?recurse', dc, token)),
             type: 'DELETE'
         }).then(function(response) {
           controller.transitionToNearestParent(grandParent);
@@ -202,7 +186,7 @@ App.KvEditController = KvBaseController.extend({
       // Put the key and the decoded (plain text) value
       // from the form.
       Ember.$.ajax({
-          url: (formatUrl("/v1/kv/" + key.get('Key'), dc, token)),
+          url: (formatUrl(consulHost + "/v1/kv/" + key.get('Key'), dc, token)),
           type: 'PUT',
           data: key.get('valueDecoded')
       }).then(function(response) {
@@ -231,7 +215,7 @@ App.KvEditController = KvBaseController.extend({
 
       // Delete the key
       Ember.$.ajax({
-          url: (formatUrl("/v1/kv/" + key.get('Key'), dc, token)),
+          url: (formatUrl(consulHost + "/v1/kv/" + key.get('Key'), dc, token)),
           type: 'DELETE'
       }).then(function(data) {
         controller.transitionToNearestParent(parent);
@@ -264,7 +248,7 @@ ItemBaseController = Ember.ArrayController.extend({
     var filter = this.get('filter');
     var status = this.get('status');
 
-    var items = this.get('items').filter(function(item, index, enumerable){
+    var items = this.get('items').filter(function(item){
       return item.get('filterKey').toLowerCase().match(filter.toLowerCase());
     });
 
@@ -281,7 +265,7 @@ ItemBaseController = Ember.ArrayController.extend({
 
   actions: {
     toggleCondensed: function() {
-      this.set('condensed', !this.get('condensed'));
+      this.toggleProperty('condensed');
     }
   }
 });
@@ -301,7 +285,7 @@ App.NodesShowController = Ember.ObjectController.extend({
       if (window.confirm("Are you sure you want to deregister this node?")) {
         // Deregister node
         Ember.$.ajax({
-            url: formatUrl('/v1/catalog/deregister', dc, token),
+            url: formatUrl(consulHost + '/v1/catalog/deregister', dc, token),
             type: 'PUT',
             data: JSON.stringify({
               'Datacenter': dc,
@@ -329,10 +313,10 @@ App.NodesShowController = Ember.ObjectController.extend({
       if (window.confirm("Are you sure you want to invalidate this session?")) {
         // Delete the session
         Ember.$.ajax({
-            url: (formatUrl("/v1/session/destroy/" + sessionId, dc, token)),
+            url: (formatUrl(consulHost + "/v1/session/destroy/" + sessionId, dc, token)),
             type: 'PUT'
         }).then(function(response) {
-          return Ember.$.getJSON(formatUrl('/v1/session/node/' + node.Node, dc, token)).then(function(data) {
+          return Ember.$.getJSON(formatUrl(consulHost + '/v1/session/node/' + node.Node, dc, token)).then(function(data) {
             controller.set('sessions', data);
           });
         }).fail(function(response) {
@@ -397,7 +381,7 @@ App.AclsController = Ember.ArrayController.extend({
 
       // Create the ACL
       Ember.$.ajax({
-          url: formatUrl('/v1/acl/create', dc, token),
+          url: formatUrl(consulHost + '/v1/acl/create', dc, token),
           type: 'PUT',
           data: JSON.stringify(newAcl)
       }).then(function(response) {
@@ -405,7 +389,7 @@ App.AclsController = Ember.ArrayController.extend({
         controller.transitionToRoute('acls.show', response.ID);
 
         // Get the ACL again, including the newly created one
-        Ember.$.getJSON(formatUrl('/v1/acl/list', dc, token)).then(function(data) {
+        Ember.$.getJSON(formatUrl(consulHost + '/v1/acl/list', dc, token)).then(function(data) {
           var objs = [];
           data.map(function(obj){
             objs.push(App.Acl.create(obj));
@@ -457,7 +441,7 @@ App.AclsShowController = Ember.ObjectController.extend({
       controller.transitionToRoute('services');
 
       Ember.$.ajax({
-          url: formatUrl('/v1/acl/clone/'+ acl.ID, dc, token),
+          url: formatUrl(consulHost + '/v1/acl/clone/'+ acl.ID, dc, token),
           type: 'PUT'
       }).then(function(response) {
         controller.transitionToRoute('acls.show', response.ID);
@@ -480,10 +464,10 @@ App.AclsShowController = Ember.ObjectController.extend({
 
       if (window.confirm("Are you sure you want to delete this token?")) {
         Ember.$.ajax({
-            url: formatUrl('/v1/acl/destroy/'+ acl.ID, dc, token),
+            url: formatUrl(consulHost + '/v1/acl/destroy/'+ acl.ID, dc, token),
             type: 'PUT'
         }).then(function(response) {
-          Ember.$.getJSON(formatUrl('/v1/acl/list', dc, token)).then(function(data) {
+          Ember.$.getJSON(formatUrl(consulHost + '/v1/acl/list', dc, token)).then(function(data) {
             objs = [];
             data.map(function(obj){
               if (obj.ID === "anonymous") {
@@ -516,7 +500,7 @@ App.AclsShowController = Ember.ObjectController.extend({
 
       // Update the ACL
       Ember.$.ajax({
-          url: formatUrl('/v1/acl/update', dc, token),
+          url: formatUrl(consulHost + '/v1/acl/update', dc, token),
           type: 'PUT',
           data: JSON.stringify(acl)
       }).then(function(response) {

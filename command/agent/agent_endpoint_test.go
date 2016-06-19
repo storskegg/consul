@@ -6,11 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/consul/testutil"
+	"github.com/hashicorp/consul/types"
 	"github.com/hashicorp/serf/serf"
 )
 
@@ -59,7 +62,7 @@ func TestHTTPAgentChecks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Err: %v", err)
 	}
-	val := obj.(map[string]*structs.HealthCheck)
+	val := obj.(map[types.CheckID]*structs.HealthCheck)
 	if len(val) != 1 {
 		t.Fatalf("bad checks: %v", obj)
 	}
@@ -81,7 +84,7 @@ func TestHTTPAgentSelf(t *testing.T) {
 
 	obj, err := srv.AgentSelf(nil, req)
 	if err != nil {
-		t.Fatalf("Err: %v", err)
+		t.Fatalf("err: %v", err)
 	}
 
 	val := obj.(AgentSelf)
@@ -91,6 +94,24 @@ func TestHTTPAgentSelf(t *testing.T) {
 
 	if int(val.Config.Ports.SerfLan) != srv.agent.config.Ports.SerfLan {
 		t.Fatalf("incorrect port: %v", obj)
+	}
+
+	c, err := srv.agent.server.GetLANCoordinate()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !reflect.DeepEqual(c, val.Coord) {
+		t.Fatalf("coordinates are not equal: %v != %v", c, val.Coord)
+	}
+
+	srv.agent.config.DisableCoordinates = true
+	obj, err = srv.AgentSelf(nil, req)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	val = obj.(AgentSelf)
+	if val.Coord != nil {
+		t.Fatalf("should have been nil: %v", val.Coord)
 	}
 }
 
@@ -274,21 +295,22 @@ func TestHTTPAgentRegisterCheck(t *testing.T) {
 	}
 
 	// Ensure we have a check mapping
-	if _, ok := srv.agent.state.Checks()["test"]; !ok {
+	checkID := types.CheckID("test")
+	if _, ok := srv.agent.state.Checks()[checkID]; !ok {
 		t.Fatalf("missing test check")
 	}
 
-	if _, ok := srv.agent.checkTTLs["test"]; !ok {
+	if _, ok := srv.agent.checkTTLs[checkID]; !ok {
 		t.Fatalf("missing test check ttl")
 	}
 
 	// Ensure the token was configured
-	if token := srv.agent.state.CheckToken("test"); token == "" {
+	if token := srv.agent.state.CheckToken(checkID); token == "" {
 		t.Fatalf("missing token")
 	}
 
 	// By default, checks start in critical state.
-	state := srv.agent.state.Checks()["test"]
+	state := srv.agent.state.Checks()[checkID]
 	if state.Status != structs.HealthCritical {
 		t.Fatalf("bad: %v", state)
 	}
@@ -323,15 +345,16 @@ func TestHTTPAgentRegisterCheckPassing(t *testing.T) {
 	}
 
 	// Ensure we have a check mapping
-	if _, ok := srv.agent.state.Checks()["test"]; !ok {
+	checkID := types.CheckID("test")
+	if _, ok := srv.agent.state.Checks()[checkID]; !ok {
 		t.Fatalf("missing test check")
 	}
 
-	if _, ok := srv.agent.checkTTLs["test"]; !ok {
+	if _, ok := srv.agent.checkTTLs[checkID]; !ok {
 		t.Fatalf("missing test check ttl")
 	}
 
-	state := srv.agent.state.Checks()["test"]
+	state := srv.agent.state.Checks()[checkID]
 	if state.Status != structs.HealthPassing {
 		t.Fatalf("bad: %v", state)
 	}
@@ -409,7 +432,6 @@ func TestHTTPAgentPassCheck(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Register node
 	req, err := http.NewRequest("GET", "/v1/agent/check/pass/test", nil)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -442,7 +464,6 @@ func TestHTTPAgentWarnCheck(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Register node
 	req, err := http.NewRequest("GET", "/v1/agent/check/warn/test", nil)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -475,7 +496,6 @@ func TestHTTPAgentFailCheck(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Register node
 	req, err := http.NewRequest("GET", "/v1/agent/check/fail/test", nil)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -493,6 +513,134 @@ func TestHTTPAgentFailCheck(t *testing.T) {
 	state := srv.agent.state.Checks()["test"]
 	if state.Status != structs.HealthCritical {
 		t.Fatalf("bad: %v", state)
+	}
+}
+
+func TestHTTPAgentUpdateCheck(t *testing.T) {
+	dir, srv := makeHTTPServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.Shutdown()
+	defer srv.agent.Shutdown()
+
+	chk := &structs.HealthCheck{Name: "test", CheckID: "test"}
+	chkType := &CheckType{TTL: 15 * time.Second}
+	if err := srv.agent.AddCheck(chk, chkType, false, ""); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	cases := []checkUpdate{
+		checkUpdate{structs.HealthPassing, "hello-passing"},
+		checkUpdate{structs.HealthCritical, "hello-critical"},
+		checkUpdate{structs.HealthWarning, "hello-warning"},
+	}
+
+	for _, c := range cases {
+		req, err := http.NewRequest("PUT", "/v1/agent/check/update/test", nil)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		req.Body = encodeReq(c)
+
+		resp := httptest.NewRecorder()
+		obj, err := srv.AgentCheckUpdate(resp, req)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if obj != nil {
+			t.Fatalf("bad: %v", obj)
+		}
+		if resp.Code != 200 {
+			t.Fatalf("expected 200, got %d", resp.Code)
+		}
+
+		state := srv.agent.state.Checks()["test"]
+		if state.Status != c.Status || state.Output != c.Output {
+			t.Fatalf("bad: %v", state)
+		}
+	}
+
+	// Make sure abusive levels of output are capped.
+	{
+		req, err := http.NewRequest("PUT", "/v1/agent/check/update/test", nil)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		update := checkUpdate{
+			Status: structs.HealthPassing,
+			Output: strings.Repeat("-= bad -=", 5*CheckBufSize),
+		}
+		req.Body = encodeReq(update)
+
+		resp := httptest.NewRecorder()
+		obj, err := srv.AgentCheckUpdate(resp, req)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if obj != nil {
+			t.Fatalf("bad: %v", obj)
+		}
+		if resp.Code != 200 {
+			t.Fatalf("expected 200, got %d", resp.Code)
+		}
+
+		// Since we append some notes about truncating, we just do a
+		// rough check that the output buffer was cut down so this test
+		// isn't super brittle.
+		state := srv.agent.state.Checks()["test"]
+		if state.Status != structs.HealthPassing || len(state.Output) > 2*CheckBufSize {
+			t.Fatalf("bad: %v", state)
+		}
+	}
+
+	// Check a bogus status.
+	{
+		req, err := http.NewRequest("PUT", "/v1/agent/check/update/test", nil)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		update := checkUpdate{
+			Status: "itscomplicated",
+		}
+		req.Body = encodeReq(update)
+
+		resp := httptest.NewRecorder()
+		obj, err := srv.AgentCheckUpdate(resp, req)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if obj != nil {
+			t.Fatalf("bad: %v", obj)
+		}
+		if resp.Code != 400 {
+			t.Fatalf("expected 400, got %d", resp.Code)
+		}
+	}
+
+	// Check a bogus verb.
+	{
+		req, err := http.NewRequest("POST", "/v1/agent/check/update/test", nil)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		update := checkUpdate{
+			Status: structs.HealthPassing,
+		}
+		req.Body = encodeReq(update)
+
+		resp := httptest.NewRecorder()
+		obj, err := srv.AgentCheckUpdate(resp, req)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if obj != nil {
+			t.Fatalf("bad: %v", obj)
+		}
+		if resp.Code != 405 {
+			t.Fatalf("expected 405, got %d", resp.Code)
+		}
 	}
 }
 
@@ -655,7 +803,7 @@ func TestHTTPAgent_EnableServiceMaintenance(t *testing.T) {
 	}
 
 	// Force the service into maintenance mode
-	req, _ := http.NewRequest("PUT", "/v1/agent/service/maintenance/test?enable=true&reason=broken", nil)
+	req, _ := http.NewRequest("PUT", "/v1/agent/service/maintenance/test?enable=true&reason=broken&token=mytoken", nil)
 	resp := httptest.NewRecorder()
 	if _, err := srv.AgentServiceMaintenance(resp, req); err != nil {
 		t.Fatalf("err: %s", err)
@@ -669,6 +817,11 @@ func TestHTTPAgent_EnableServiceMaintenance(t *testing.T) {
 	check, ok := srv.agent.state.Checks()[checkID]
 	if !ok {
 		t.Fatalf("should have registered maintenance check")
+	}
+
+	// Ensure the token was added
+	if token := srv.agent.state.CheckToken(checkID); token != "mytoken" {
+		t.Fatalf("expected 'mytoken', got '%s'", token)
 	}
 
 	// Ensure the reason was set in notes
@@ -693,7 +846,7 @@ func TestHTTPAgent_DisableServiceMaintenance(t *testing.T) {
 	}
 
 	// Force the service into maintenance mode
-	if err := srv.agent.EnableServiceMaintenance("test", ""); err != nil {
+	if err := srv.agent.EnableServiceMaintenance("test", "", ""); err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
@@ -749,7 +902,7 @@ func TestHTTPAgent_EnableNodeMaintenance(t *testing.T) {
 
 	// Force the node into maintenance mode
 	req, _ := http.NewRequest(
-		"PUT", "/v1/agent/self/maintenance?enable=true&reason=broken", nil)
+		"PUT", "/v1/agent/self/maintenance?enable=true&reason=broken&token=mytoken", nil)
 	resp := httptest.NewRecorder()
 	if _, err := srv.AgentNodeMaintenance(resp, req); err != nil {
 		t.Fatalf("err: %s", err)
@@ -762,6 +915,11 @@ func TestHTTPAgent_EnableNodeMaintenance(t *testing.T) {
 	check, ok := srv.agent.state.Checks()[nodeMaintCheckID]
 	if !ok {
 		t.Fatalf("should have registered maintenance check")
+	}
+
+	// Check that the token was used
+	if token := srv.agent.state.CheckToken(nodeMaintCheckID); token != "mytoken" {
+		t.Fatalf("expected 'mytoken', got '%s'", token)
 	}
 
 	// Ensure the reason was set in notes
@@ -777,7 +935,7 @@ func TestHTTPAgent_DisableNodeMaintenance(t *testing.T) {
 	defer srv.agent.Shutdown()
 
 	// Force the node into maintenance mode
-	srv.agent.EnableNodeMaintenance("")
+	srv.agent.EnableNodeMaintenance("", "")
 
 	// Leave maintenance mode
 	req, _ := http.NewRequest("PUT", "/v1/agent/self/maintenance?enable=false", nil)

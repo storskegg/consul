@@ -25,9 +25,10 @@ The following endpoints are supported:
 * [`/v1/agent/force-leave/<node>`](#agent_force_leave)>: Forces removal of a node
 * [`/v1/agent/check/register`](#agent_check_register) : Registers a new local check
 * [`/v1/agent/check/deregister/<checkID>`](#agent_check_deregister) : Deregisters a local check
-* [`/v1/agent/check/pass/<checkID>`](#agent_check_pass) : Marks a local test as passing
-* [`/v1/agent/check/warn/<checkID>`](#agent_check_warn) : Marks a local test as warning
-* [`/v1/agent/check/fail/<checkID>`](#agent_check_fail) : Marks a local test as critical
+* [`/v1/agent/check/pass/<checkID>`](#agent_check_pass) : Marks a local check as passing
+* [`/v1/agent/check/warn/<checkID>`](#agent_check_warn) : Marks a local check as warning
+* [`/v1/agent/check/fail/<checkID>`](#agent_check_fail) : Marks a local check as critical
+* [`/v1/agent/check/update/<checkID>`](#agent_check_update) : Updates a local check
 * [`/v1/agent/service/register`](#agent_service_register) : Registers a new local service
 * [`/v1/agent/service/deregister/<serviceID>`](#agent_service_deregister) : Deregisters a local service
 * [`/v1/agent/service/maintenance/<serviceID>`](#agent_service_maintenance) : Manages service maintenance mode
@@ -163,6 +164,11 @@ It returns a JSON body like this:
     "EnableSyslog": false,
     "RejoinAfterLeave": false
   },
+  "Coord": {
+    "Adjustment": 0,
+    "Error": 1.5,
+    "Vec": [0,0,0,0,0,0,0,0]
+  },
   "Member": {
     "Name": "foobar",
     "Addr": "10.1.10.12",
@@ -236,6 +242,8 @@ body must look like:
   "Name": "Memory utilization",
   "Notes": "Ensure we don't oversubscribe memory",
   "Script": "/usr/local/bin/check_mem.py",
+  "DockerContainerID": "f972c95ebf0e",
+  "Shell": "/bin/bash",
   "HTTP": "http://example.com",
   "TCP": "example.com:22",
   "Interval": "10s",
@@ -253,6 +261,10 @@ The `Notes` field is not used internally by Consul and is meant to be human-read
 
 If a `Script` is provided, the check type is a script, and Consul will
 evaluate the script every `Interval` to update the status.
+
+If a `DockerContainerID` is provided, the check is a Docker check, and Consul will
+evaluate the script every `Interval` in the given container using the specified
+`Shell`. Note that `Shell` is currently only supported for Docker checks.
 
 An `HTTP` check will perform an HTTP GET request against the value of `HTTP` (expected to
 be a URL) every `Interval`. If the response is any `2xx` code, the check is `passing`.
@@ -280,7 +292,7 @@ This endpoint supports [ACL tokens](/docs/internals/acl.html). If the query
 string includes a `?token=<token-id>`, the registration will use the provided
 token to authorize the request. The token is also persisted in the agent's
 local configuration to enable periodic
-[anti-entropy](/docs/internal/anti-entropy.html) syncs and seamless agent
+[anti-entropy](/docs/internals/anti-entropy.html) syncs and seamless agent
 restarts.
 
 The return code is 200 on success.
@@ -299,8 +311,9 @@ This endpoint is used with a check that is of the [TTL type](/docs/agent/checks.
 When this endpoint is accessed via a GET, the status of the check is set to `passing`
 and the TTL clock is reset.
 
-The optional "?note=" query parameter can be used to associate a human-readable message 
-with the status of the check.
+The optional "?note=" query parameter can be used to associate a human-readable message
+with the status of the check. This will be passed through to the check's `Output` field
+in the check endpoints.
 
 The return code is 200 on success.
 
@@ -310,8 +323,9 @@ This endpoint is used with a check that is of the [TTL type](/docs/agent/checks.
 When this endpoint is accessed via a GET, the status of the check is set to `warning`,
 and the TTL clock is reset.
 
-The optional "?note=" query parameter can be used to associate a human-readable message 
-with the status of the check.
+The optional "?note=" query parameter can be used to associate a human-readable message
+with the status of the check. This will be passed through to the check's `Output` field
+in the check endpoints.
 
 The return code is 200 on success.
 
@@ -321,8 +335,33 @@ This endpoint is used with a check that is of the [TTL type](/docs/agent/checks.
 When this endpoint is accessed via a GET, the status of the check is set to `critical`,
 and the TTL clock is reset.
 
-The optional "?note=" query parameter can be used to associate a human-readable message 
-with the status of the check.
+The optional "?note=" query parameter can be used to associate a human-readable message
+with the status of the check. This will be passed through to the check's `Output` field
+in the check endpoints.
+
+The return code is 200 on success.
+
+### <a name="agent_check_update"></a> /v1/agent/check/update/\<checkId\>
+
+This endpoint is used with a check that is of the [TTL type](/docs/agent/checks.html).
+When this endpoint is accessed with a PUT, the status and output of the check are
+updated and the TTL clock is reset.
+
+This endpoint expects a JSON request body to be put. The request body must look like:
+
+```javascript
+{
+  "Status": "passing",
+  "Output": "curl reported a failure:\n\n..."
+}
+```
+
+The `Status` field is mandatory, and must be set to "passing", "warning", or "critical".
+
+`Output` is an optional field that will associate a human-readable message with the status
+of the check, such as the output of the checking script or process. This will be truncated
+if it exceeds 4KB in size. This will be passed through to the check's `Output` field in the
+check endpoints.
 
 The return code is 200 on success.
 
@@ -330,7 +369,8 @@ The return code is 200 on success.
 
 The register endpoint is used to add a new service, with an optional health check,
 to the local agent. There is more documentation on services [here](/docs/agent/services.html).
-The agent is responsible for managing the status of the service and keeping the Catalog in sync.
+The agent is responsible for managing the status of its local services, and for sending updates
+about its local services to the servers to keep the global Catalog in sync.
 
 The register endpoint expects a JSON request body to be PUT. The request
 body must look like:
@@ -360,9 +400,15 @@ in the case of a collision.
 
 `Tags`, `Address`, `Port` and `Check` are optional.
 
-`Address` will default to that of the agent if not provided.
+If `Address` is not provided or left empty, then the agent's address will be used
+as the address for the service during DNS queries. When querying for services using
+HTTP endpoints such as [service health](/docs/agent/http/health.html#health_service)
+or [service catalog](/docs/agent/http/catalog.html#catalog_service) and encountering
+an empty `Address` field for a service, use the `Address` field of the agent node
+associated with that instance of the service, which is returned alongside the service
+information.
 
-If `Check` is provided, only one of `Script`, `HTTP`, or `TTL` should be specified.
+If `Check` is provided, only one of `Script`, `HTTP`, `TCP` or `TTL` should be specified.
 `Script` and `HTTP` also require `Interval`. The created check will be named "service:\<ServiceId\>".
 There is more information about checks [here](/docs/agent/checks.html).
 
@@ -370,7 +416,7 @@ This endpoint supports [ACL tokens](/docs/internals/acl.html). If the query
 string includes a `?token=<token-id>`, the registration will use the provided
 token to authorize the request. The token is also persisted in the agent's
 local configuration to enable periodic
-[anti-entropy](/docs/internal/anti-entropy.html) syncs and seamless agent
+[anti-entropy](/docs/internals/anti-entropy.html) syncs and seamless agent
 restarts.
 
 The return code is 200 on success.
@@ -390,7 +436,7 @@ The service maintenance endpoint allows placing a given service into
 "maintenance mode". During maintenance mode, the service will be marked as
 unavailable and will not be present in DNS or API queries. This API call is
 idempotent. Maintenance mode is persistent and will be automatically restored
-on agent restart.
+on agent restart. The maintenance endpoint expects a PUT request.
 
 The `?enable` flag is required.  Acceptable values are either `true` (to enter
 maintenance mode) or `false` (to resume normal operation).

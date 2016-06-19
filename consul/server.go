@@ -11,13 +11,17 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/consul/consul/agent"
+	"github.com/hashicorp/consul/consul/state"
 	"github.com/hashicorp/consul/tlsutil"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/raft-boltdb"
+	"github.com/hashicorp/serf/coordinate"
 	"github.com/hashicorp/serf/serf"
 )
 
@@ -26,26 +30,33 @@ import (
 // protocol versions.
 const (
 	ProtocolVersionMin uint8 = 1
-	ProtocolVersionMax       = 3
+
+	// Version 3 added support for network coordinates but we kept the
+	// default protocol version at 2 to ease the transition to this new
+	// feature. A Consul agent speaking version 2 of the protocol will
+	// attempt to send its coordinates to a server who understands version
+	// 3 or greater.
+	ProtocolVersion2Compatible = 2
+
+	ProtocolVersionMax = 3
 )
 
 const (
 	serfLANSnapshot   = "serf/local.snapshot"
 	serfWANSnapshot   = "serf/remote.snapshot"
 	raftState         = "raft/"
-	tmpStatePath      = "tmp/"
 	snapshotsRetained = 2
 
 	// serverRPCCache controls how long we keep an idle connection
 	// open to a server
 	serverRPCCache = 2 * time.Minute
 
-	// serverMaxStreams controsl how many idle streams we keep
+	// serverMaxStreams controls how many idle streams we keep
 	// open to a server
 	serverMaxStreams = 64
 
 	// raftLogCacheSize is the maximum number of logs to cache in-memory.
-	// This is used to reduce disk I/O for the recently commited entries.
+	// This is used to reduce disk I/O for the recently committed entries.
 	raftLogCacheSize = 512
 
 	// raftRemoveGracePeriod is how long we wait to allow a RemovePeer
@@ -88,7 +99,7 @@ type Server struct {
 
 	// localConsuls is used to track the known consuls
 	// in the local datacenter. Used to do leader forwarding.
-	localConsuls map[string]*serverParts
+	localConsuls map[string]*agent.Server
 	localLock    sync.RWMutex
 
 	// Logger uses the provided LogOutput
@@ -101,6 +112,7 @@ type Server struct {
 	raftPeers     raft.PeerStore
 	raftStore     *raftboltdb.BoltStore
 	raftTransport *raft.NetworkTransport
+	raftInmem     *raft.InmemStore
 
 	// reconcileCh is used to pass events from the serf handler
 	// into the leader manager, so that the strong state can be
@@ -109,7 +121,7 @@ type Server struct {
 
 	// remoteConsuls is used to track the known consuls in
 	// remote datacenters. Used to do DC forwarding.
-	remoteConsuls map[string][]*serverParts
+	remoteConsuls map[string][]*agent.Server
 	remoteLock    sync.RWMutex
 
 	// rpcListener is used to listen for incoming connections
@@ -129,13 +141,13 @@ type Server struct {
 
 	// sessionTimers track the expiration time of each Session that has
 	// a TTL. On expiration, a SessionDestroy event will occur, and
-	// destroy the session via standard session destory processing
+	// destroy the session via standard session destroy processing
 	sessionTimers     map[string]*time.Timer
 	sessionTimersLock sync.Mutex
 
 	// tombstoneGC is used to track the pending GC invocations
 	// for the KV tombstones
-	tombstoneGC *TombstoneGC
+	tombstoneGC *state.TombstoneGC
 
 	shutdown     bool
 	shutdownCh   chan struct{}
@@ -144,13 +156,16 @@ type Server struct {
 
 // Holds the RPC endpoints
 type endpoints struct {
-	Catalog  *Catalog
-	Health   *Health
-	Status   *Status
-	KVS      *KVS
-	Session  *Session
-	Internal *Internal
-	ACL      *ACL
+	Catalog       *Catalog
+	Health        *Health
+	Status        *Status
+	KVS           *KVS
+	Session       *Session
+	Internal      *Internal
+	ACL           *ACL
+	Coordinate    *Coordinate
+	PreparedQuery *PreparedQuery
+	Txn           *Txn
 }
 
 // NewServer is used to construct a new Consul server from the
@@ -162,7 +177,7 @@ func NewServer(config *Config) (*Server, error) {
 	}
 
 	// Check for a data directory!
-	if config.DataDir == "" {
+	if config.DataDir == "" && !config.DevMode {
 		return nil, fmt.Errorf("Config must provide a DataDir")
 	}
 
@@ -193,7 +208,7 @@ func NewServer(config *Config) (*Server, error) {
 	logger := log.New(config.LogOutput, "", log.LstdFlags)
 
 	// Create the tombstone GC
-	gc, err := NewTombstoneGC(config.TombstoneTTL, config.TombstoneTTLGranularity)
+	gc, err := state.NewTombstoneGC(config.TombstoneTTL, config.TombstoneTTLGranularity)
 	if err != nil {
 		return nil, err
 	}
@@ -204,10 +219,10 @@ func NewServer(config *Config) (*Server, error) {
 		connPool:      NewPool(config.LogOutput, serverRPCCache, serverMaxStreams, tlsWrap),
 		eventChLAN:    make(chan serf.Event, 256),
 		eventChWAN:    make(chan serf.Event, 256),
-		localConsuls:  make(map[string]*serverParts),
+		localConsuls:  make(map[string]*agent.Server),
 		logger:        logger,
 		reconcileCh:   make(chan serf.Member, 32),
-		remoteConsuls: make(map[string][]*serverParts),
+		remoteConsuls: make(map[string][]*agent.Server),
 		rpcServer:     rpc.NewServer(),
 		rpcTLS:        incomingTLS,
 		tombstoneGC:   gc,
@@ -290,7 +305,9 @@ func (s *Server) setupSerf(conf *serf.Config, ch chan serf.Event, path string, w
 	conf.MemberlistConfig.LogOutput = s.config.LogOutput
 	conf.LogOutput = s.config.LogOutput
 	conf.EventCh = ch
-	conf.SnapshotPath = filepath.Join(s.config.DataDir, path)
+	if !s.config.DevMode {
+		conf.SnapshotPath = filepath.Join(s.config.DataDir, path)
+	}
 	conf.ProtocolVersion = protocolVersionMap[s.config.ProtocolVersion]
 	conf.RejoinAfterLeave = s.config.RejoinAfterLeave
 	if wan {
@@ -306,56 +323,24 @@ func (s *Server) setupSerf(conf *serf.Config, ch chan serf.Event, path string, w
 	if err := ensurePath(conf.SnapshotPath, false); err != nil {
 		return nil, err
 	}
+
+	// Plumb down the enable coordinates flag.
+	conf.DisableCoordinates = s.config.DisableCoordinates
+
 	return serf.Create(conf)
 }
 
 // setupRaft is used to setup and initialize Raft
 func (s *Server) setupRaft() error {
 	// If we are in bootstrap mode, enable a single node cluster
-	if s.config.Bootstrap {
+	if s.config.Bootstrap || s.config.DevMode {
 		s.config.RaftConfig.EnableSingleNode = true
-	}
-
-	// Create the base state path
-	statePath := filepath.Join(s.config.DataDir, tmpStatePath)
-	if err := os.RemoveAll(statePath); err != nil {
-		return err
-	}
-	if err := ensurePath(statePath, true); err != nil {
-		return err
 	}
 
 	// Create the FSM
 	var err error
-	s.fsm, err = NewFSM(s.tombstoneGC, statePath, s.config.LogOutput)
+	s.fsm, err = NewFSM(s.tombstoneGC, s.config.LogOutput)
 	if err != nil {
-		return err
-	}
-
-	// Create the base raft path
-	path := filepath.Join(s.config.DataDir, raftState)
-	if err := ensurePath(path, true); err != nil {
-		return err
-	}
-
-	// Create the backend raft store for logs and stable storage
-	store, err := raftboltdb.NewBoltStore(filepath.Join(path, "raft.db"))
-	if err != nil {
-		return err
-	}
-	s.raftStore = store
-
-	// Wrap the store in a LogCache to improve performance
-	cacheStore, err := raft.NewLogCache(raftLogCacheSize, store)
-	if err != nil {
-		store.Close()
-		return err
-	}
-
-	// Create the snapshot store
-	snapshots, err := raft.NewFileSnapshotStore(path, snapshotsRetained, s.config.LogOutput)
-	if err != nil {
-		store.Close()
 		return err
 	}
 
@@ -363,18 +348,63 @@ func (s *Server) setupRaft() error {
 	trans := raft.NewNetworkTransport(s.raftLayer, 3, 10*time.Second, s.config.LogOutput)
 	s.raftTransport = trans
 
-	// Setup the peer store
-	s.raftPeers = raft.NewJSONPeers(path, trans)
+	var log raft.LogStore
+	var stable raft.StableStore
+	var snap raft.SnapshotStore
 
-	// Ensure local host is always included if we are in bootstrap mode
-	if s.config.Bootstrap {
-		peers, err := s.raftPeers.Peers()
+	if s.config.DevMode {
+		store := raft.NewInmemStore()
+		s.raftInmem = store
+		stable = store
+		log = store
+		snap = raft.NewDiscardSnapshotStore()
+		s.raftPeers = &raft.StaticPeers{}
+	} else {
+		// Create the base raft path
+		path := filepath.Join(s.config.DataDir, raftState)
+		if err := ensurePath(path, true); err != nil {
+			return err
+		}
+
+		// Create the backend raft store for logs and stable storage
+		store, err := raftboltdb.NewBoltStore(filepath.Join(path, "raft.db"))
+		if err != nil {
+			return err
+		}
+		s.raftStore = store
+		stable = store
+
+		// Wrap the store in a LogCache to improve performance
+		cacheStore, err := raft.NewLogCache(raftLogCacheSize, store)
 		if err != nil {
 			store.Close()
 			return err
 		}
-		if !raft.PeerContained(peers, trans.LocalAddr()) {
-			s.raftPeers.SetPeers(raft.AddUniquePeer(peers, trans.LocalAddr()))
+		log = cacheStore
+
+		// Create the snapshot store
+		snapshots, err := raft.NewFileSnapshotStore(path, snapshotsRetained, s.config.LogOutput)
+		if err != nil {
+			store.Close()
+			return err
+		}
+		snap = snapshots
+
+		// Setup the peer store
+		s.raftPeers = raft.NewJSONPeers(path, trans)
+	}
+
+	// Ensure local host is always included if we are in bootstrap mode
+	if s.config.Bootstrap {
+		peerAddrs, err := s.raftPeers.Peers()
+		if err != nil {
+			if s.raftStore != nil {
+				s.raftStore.Close()
+			}
+			return err
+		}
+		if !raft.PeerContained(peerAddrs, trans.LocalAddr()) {
+			s.raftPeers.SetPeers(raft.AddUniquePeer(peerAddrs, trans.LocalAddr()))
 		}
 	}
 
@@ -382,10 +412,12 @@ func (s *Server) setupRaft() error {
 	s.config.RaftConfig.LogOutput = s.config.LogOutput
 
 	// Setup the Raft store
-	s.raft, err = raft.NewRaft(s.config.RaftConfig, s.fsm, cacheStore, store,
-		snapshots, s.raftPeers, trans)
+	s.raft, err = raft.NewRaft(s.config.RaftConfig, s.fsm, log, stable,
+		snap, s.raftPeers, trans)
 	if err != nil {
-		store.Close()
+		if s.raftStore != nil {
+			s.raftStore.Close()
+		}
 		trans.Close()
 		return err
 	}
@@ -405,6 +437,9 @@ func (s *Server) setupRPC(tlsWrap tlsutil.DCWrapper) error {
 	s.endpoints.Session = &Session{s}
 	s.endpoints.Internal = &Internal{s}
 	s.endpoints.ACL = &ACL{s}
+	s.endpoints.Coordinate = NewCoordinate(s)
+	s.endpoints.PreparedQuery = &PreparedQuery{s}
+	s.endpoints.Txn = &Txn{s}
 
 	// Register the handlers
 	s.rpcServer.Register(s.endpoints.Status)
@@ -414,6 +449,9 @@ func (s *Server) setupRPC(tlsWrap tlsutil.DCWrapper) error {
 	s.rpcServer.Register(s.endpoints.Session)
 	s.rpcServer.Register(s.endpoints.Internal)
 	s.rpcServer.Register(s.endpoints.ACL)
+	s.rpcServer.Register(s.endpoints.Coordinate)
+	s.rpcServer.Register(s.endpoints.PreparedQuery)
+	s.rpcServer.Register(s.endpoints.Txn)
 
 	list, err := net.ListenTCP("tcp", s.config.RPCAddr)
 	if err != nil {
@@ -474,7 +512,9 @@ func (s *Server) Shutdown() error {
 		if err := future.Error(); err != nil {
 			s.logger.Printf("[WARN] consul: Error shutting down raft: %s", err)
 		}
-		s.raftStore.Close()
+		if s.raftStore != nil {
+			s.raftStore.Close()
+		}
 
 		// Clear the peer set on a graceful leave to avoid
 		// triggering elections on a rejoin.
@@ -489,11 +529,6 @@ func (s *Server) Shutdown() error {
 
 	// Close the connection pool
 	s.connPool.Shutdown()
-
-	// Close the fsm
-	if s.fsm != nil {
-		s.fsm.Close()
-	}
 
 	return nil
 }
@@ -566,7 +601,7 @@ func (s *Server) Leave() error {
 }
 
 // numOtherPeers is used to check on the number of known peers
-// excluding the local ndoe
+// excluding the local node
 func (s *Server) numOtherPeers() (int, error) {
 	peers, err := s.raftPeers.Peers()
 	if err != nil {
@@ -684,6 +719,12 @@ func (s *Server) RPC(method string, args interface{}, reply interface{}) error {
 	return codec.err
 }
 
+// InjectEndpoint is used to substitute an endpoint for testing.
+func (s *Server) InjectEndpoint(endpoint interface{}) error {
+	s.logger.Printf("[WARN] consul: endpoint injected; this should only be used for testing")
+	return s.rpcServer.Register(endpoint)
+}
+
 // Stats is used to return statistics for debugging and insight
 // for various sub-systems
 func (s *Server) Stats() map[string]map[string]string {
@@ -694,6 +735,7 @@ func (s *Server) Stats() map[string]map[string]string {
 		"consul": map[string]string{
 			"server":            "true",
 			"leader":            fmt.Sprintf("%v", s.IsLeader()),
+			"leader_addr":       s.raft.Leader(),
 			"bootstrap":         fmt.Sprintf("%v", s.config.Bootstrap),
 			"known_datacenters": toString(uint64(len(s.remoteConsuls))),
 		},
@@ -702,5 +744,20 @@ func (s *Server) Stats() map[string]map[string]string {
 		"serf_wan": s.serfWAN.Stats(),
 		"runtime":  runtimeStats(),
 	}
+	if peers, err := s.raftPeers.Peers(); err == nil {
+		stats["raft"]["raft_peers"] = strings.Join(peers, ",")
+	} else {
+		s.logger.Printf("[DEBUG] server: error getting raft peers: %v", err)
+	}
 	return stats
+}
+
+// GetLANCoordinate returns the coordinate of the server in the LAN gossip pool.
+func (s *Server) GetLANCoordinate() (*coordinate.Coordinate, error) {
+	return s.serfLAN.GetCoordinate()
+}
+
+// GetWANCoordinate returns the coordinate of the server in the WAN gossip pool.
+func (s *Server) GetWANCoordinate() (*coordinate.Coordinate, error) {
+	return s.serfWAN.GetCoordinate()
 }

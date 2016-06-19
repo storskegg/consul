@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/consul/consul"
 	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/consul/types"
 )
 
 func TestSessionCreate(t *testing.T) {
@@ -38,7 +39,7 @@ func TestSessionCreate(t *testing.T) {
 		raw := map[string]interface{}{
 			"Name":      "my-cool-session",
 			"Node":      srv.agent.config.NodeName,
-			"Checks":    []string{consul.SerfCheckID, "consul"},
+			"Checks":    []types.CheckID{consul.SerfCheckID, "consul"},
 			"LockDelay": "20s",
 		}
 		enc.Encode(raw)
@@ -86,7 +87,7 @@ func TestSessionCreateDelete(t *testing.T) {
 		raw := map[string]interface{}{
 			"Name":      "my-cool-session",
 			"Node":      srv.agent.config.NodeName,
-			"Checks":    []string{consul.SerfCheckID, "consul"},
+			"Checks":    []types.CheckID{consul.SerfCheckID, "consul"},
 			"LockDelay": "20s",
 			"Behavior":  structs.SessionKeysDelete,
 		}
@@ -350,6 +351,22 @@ func TestSessionTTLRenew(t *testing.T) {
 
 func TestSessionGet(t *testing.T) {
 	httpTest(t, func(srv *HTTPServer) {
+		req, err := http.NewRequest("GET", "/v1/session/info/adf4238a-882b-9ddc-4a9d-5b6758e4159e", nil)
+		resp := httptest.NewRecorder()
+		obj, err := srv.SessionGet(resp, req)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		respObj, ok := obj.(structs.Sessions)
+		if !ok {
+			t.Fatalf("should work")
+		}
+		if respObj == nil || len(respObj) != 0 {
+			t.Fatalf("bad: %v", respObj)
+		}
+	})
+
+	httpTest(t, func(srv *HTTPServer) {
 		id := makeTestSession(t, srv)
 
 		req, err := http.NewRequest("GET",
@@ -370,6 +387,22 @@ func TestSessionGet(t *testing.T) {
 }
 
 func TestSessionList(t *testing.T) {
+	httpTest(t, func(srv *HTTPServer) {
+		req, err := http.NewRequest("GET", "/v1/session/list", nil)
+		resp := httptest.NewRecorder()
+		obj, err := srv.SessionList(resp, req)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		respObj, ok := obj.(structs.Sessions)
+		if !ok {
+			t.Fatalf("should work")
+		}
+		if respObj == nil || len(respObj) != 0 {
+			t.Fatalf("bad: %v", respObj)
+		}
+	})
+
 	httpTest(t, func(srv *HTTPServer) {
 		var ids []string
 		for i := 0; i < 10; i++ {
@@ -393,6 +426,23 @@ func TestSessionList(t *testing.T) {
 }
 
 func TestSessionsForNode(t *testing.T) {
+	httpTest(t, func(srv *HTTPServer) {
+		req, err := http.NewRequest("GET",
+			"/v1/session/node/"+srv.agent.config.NodeName, nil)
+		resp := httptest.NewRecorder()
+		obj, err := srv.SessionsForNode(resp, req)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		respObj, ok := obj.(structs.Sessions)
+		if !ok {
+			t.Fatalf("should work")
+		}
+		if respObj == nil || len(respObj) != 0 {
+			t.Fatalf("bad: %v", respObj)
+		}
+	})
+
 	httpTest(t, func(srv *HTTPServer) {
 		var ids []string
 		for i := 0; i < 10; i++ {

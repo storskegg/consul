@@ -4,19 +4,25 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/armon/go-metrics"
+	"github.com/hashicorp/consul/consul"
 	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/consul/lib"
 	"github.com/miekg/dns"
 )
 
 const (
-	maxServiceResponses = 3 // For UDP only
-	maxRecurseRecords   = 5
+	// UDP can fit ~25 A records in a 512B response, and ~14 AAAA
+	// records.  Limit further to prevent unintentional configuration
+	// abuse that would have a negative effect on application response
+	// times.
+	maxUDPAnswerLimit = 8
+	maxRecurseRecords = 5
 )
 
 // DNSServer is used to wrap an Agent and expose various
@@ -165,7 +171,10 @@ START:
 func (d *DNSServer) handlePtr(resp dns.ResponseWriter, req *dns.Msg) {
 	q := req.Question[0]
 	defer func(s time.Time) {
-		d.logger.Printf("[DEBUG] dns: request for %v (%v)", q, time.Now().Sub(s))
+		metrics.MeasureSince([]string{"consul", "dns", "ptr_query", d.agent.config.NodeName}, s)
+		d.logger.Printf("[DEBUG] dns: request for %v (%v) from client %s (%s)",
+			q, time.Now().Sub(s), resp.RemoteAddr().String(),
+			resp.RemoteAddr().Network())
 	}(time.Now())
 
 	// Setup the message response
@@ -221,11 +230,14 @@ func (d *DNSServer) handlePtr(resp dns.ResponseWriter, req *dns.Msg) {
 	}
 }
 
-// handleQUery is used to handle DNS queries in the configured domain
+// handleQuery is used to handle DNS queries in the configured domain
 func (d *DNSServer) handleQuery(resp dns.ResponseWriter, req *dns.Msg) {
 	q := req.Question[0]
 	defer func(s time.Time) {
-		d.logger.Printf("[DEBUG] dns: request for %v (%v)", q, time.Now().Sub(s))
+		metrics.MeasureSince([]string{"consul", "dns", "domain_query", d.agent.config.NodeName}, s)
+		d.logger.Printf("[DEBUG] dns: request for %v (%v) from client %s (%s)",
+			q, time.Now().Sub(s), resp.RemoteAddr().String(),
+			resp.RemoteAddr().Network())
 	}(time.Now())
 
 	// Switch to TCP if the client is
@@ -286,7 +298,7 @@ func (d *DNSServer) dispatch(network string, req, resp *dns.Msg) {
 	// Split into the label parts
 	labels := dns.SplitDomainName(qName)
 
-	// The last label is either "node", "service" or a datacenter name
+	// The last label is either "node", "service", "query", or a datacenter name
 PARSE:
 	n := len(labels)
 	if n == 0 {
@@ -326,12 +338,22 @@ PARSE:
 		}
 
 	case "node":
-		if len(labels) == 1 {
+		if n == 1 {
 			goto INVALID
 		}
+
 		// Allow a "." in the node name, just join all the parts
 		node := strings.Join(labels[:n-1], ".")
 		d.nodeLookup(network, datacenter, node, req, resp)
+
+	case "query":
+		if n == 1 {
+			goto INVALID
+		}
+
+		// Allow a "." in the query name, just join all the parts.
+		query := strings.Join(labels[:n-1], ".")
+		d.preparedQueryLookup(network, datacenter, query, req, resp)
 
 	default:
 		// Store the DC, and re-parse
@@ -346,11 +368,24 @@ INVALID:
 	resp.SetRcode(req, dns.RcodeNameError)
 }
 
+// translateAddr is used to provide the final, translated address for a node,
+// depending on how this agent and the other node are configured.
+func (d *DNSServer) translateAddr(dc string, node *structs.Node) string {
+	addr := node.Address
+	if d.agent.config.TranslateWanAddrs && (d.agent.config.Datacenter != dc) {
+		wanAddr := node.TaggedAddresses["wan"]
+		if wanAddr != "" {
+			addr = wanAddr
+		}
+	}
+	return addr
+}
+
 // nodeLookup is used to handle a node query
 func (d *DNSServer) nodeLookup(network, datacenter, node string, req, resp *dns.Msg) {
-	// Only handle ANY and A type requests
+	// Only handle ANY, A and AAAA type requests
 	qType := req.Question[0].Qtype
-	if qType != dns.TypeANY && qType != dns.TypeA {
+	if qType != dns.TypeANY && qType != dns.TypeA && qType != dns.TypeAAAA {
 		return
 	}
 
@@ -386,7 +421,8 @@ RPC:
 	}
 
 	// Add the node record
-	records := d.formatNodeRecord(&out.NodeServices.Node, out.NodeServices.Node.Address,
+	addr := d.translateAddr(datacenter, out.NodeServices.Node)
+	records := d.formatNodeRecord(out.NodeServices.Node, addr,
 		req.Question[0].Name, qType, d.config.NodeTTL)
 	if records != nil {
 		resp.Answer = append(resp.Answer, records...)
@@ -456,6 +492,26 @@ func (d *DNSServer) formatNodeRecord(node *structs.Node, addr, qName string, qTy
 	return records
 }
 
+// trimUDPAnswers makes sure a UDP response is not longer than allowed by RFC
+// 1035.  Enforce an arbitrary limit that can be further ratcheted down by
+// config, and then make sure the response doesn't exceed 512 bytes.
+func trimUDPAnswers(config *DNSConfig, resp *dns.Msg) (trimmed bool) {
+	numAnswers := len(resp.Answer)
+
+	// This cuts UDP responses to a useful but limited number of responses.
+	maxAnswers := lib.MinInt(maxUDPAnswerLimit, config.UDPAnswerLimit)
+	if numAnswers > maxAnswers {
+		resp.Answer = resp.Answer[:maxAnswers]
+	}
+
+	// This enforces the hard limit of 512 bytes per the RFC.
+	for len(resp.Answer) > 0 && resp.Len() > 512 {
+		resp.Answer = resp.Answer[:len(resp.Answer)-1]
+	}
+
+	return len(resp.Answer) < numAnswers
+}
+
 // serviceLookup is used to handle a service query
 func (d *DNSServer) serviceLookup(network, datacenter, service, tag string, req, resp *dns.Msg) {
 	// Make an RPC request
@@ -495,7 +551,7 @@ RPC:
 	}
 
 	// Filter out any service nodes due to health checks
-	out.Nodes = d.filterServiceNodes(out.Nodes)
+	out.Nodes = out.Nodes.Filter(d.config.OnlyPassing)
 
 	// If we have no nodes, return not found!
 	if len(out.Nodes) == 0 {
@@ -505,77 +561,151 @@ RPC:
 	}
 
 	// Perform a random shuffle
-	shuffleServiceNodes(out.Nodes)
-
-	// If the network is not TCP, restrict the number of responses
-	if network != "tcp" && len(out.Nodes) > maxServiceResponses {
-		out.Nodes = out.Nodes[:maxServiceResponses]
-
-		// Flag that there are more records to return in the UDP response
-		if d.config.EnableTruncate {
-			resp.Truncated = true
-		}
-	}
+	out.Nodes.Shuffle()
 
 	// Add various responses depending on the request
 	qType := req.Question[0].Qtype
-	d.serviceNodeRecords(out.Nodes, req, resp, ttl)
+	d.serviceNodeRecords(datacenter, out.Nodes, req, resp, ttl)
 
 	if qType == dns.TypeSRV {
 		d.serviceSRVRecords(datacenter, out.Nodes, req, resp, ttl)
 	}
-}
 
-// filterServiceNodes is used to filter out nodes that are failing
-// health checks to prevent routing to unhealthy nodes
-func (d *DNSServer) filterServiceNodes(nodes structs.CheckServiceNodes) structs.CheckServiceNodes {
-	n := len(nodes)
-OUTER:
-	for i := 0; i < n; i++ {
-		node := nodes[i]
-		for _, check := range node.Checks {
-			if check.Status == structs.HealthCritical ||
-				(d.config.OnlyPassing && check.Status != structs.HealthPassing) {
-				d.logger.Printf("[WARN] dns: node '%s' failing health check '%s: %s', dropping from service '%s'",
-					node.Node.Node, check.CheckID, check.Name, node.Service.Service)
-				nodes[i], nodes[n-1] = nodes[n-1], structs.CheckServiceNode{}
-				n--
-				i--
-				continue OUTER
-			}
+	// If the network is not TCP, restrict the number of responses
+	if network != "tcp" {
+		wasTrimmed := trimUDPAnswers(d.config, resp)
+
+		// Flag that there are more records to return in the UDP response
+		if wasTrimmed && d.config.EnableTruncate {
+			resp.Truncated = true
 		}
 	}
-	return nodes[:n]
+
+	// If the answer is empty and the response isn't truncated, return not found
+	if len(resp.Answer) == 0 && !resp.Truncated {
+		d.addSOA(d.domain, resp)
+		return
+	}
 }
 
-// shuffleServiceNodes does an in-place random shuffle using the Fisher-Yates algorithm
-func shuffleServiceNodes(nodes structs.CheckServiceNodes) {
-	for i := len(nodes) - 1; i > 0; i-- {
-		j := rand.Int31() % int32(i+1)
-		nodes[i], nodes[j] = nodes[j], nodes[i]
+// preparedQueryLookup is used to handle a prepared query.
+func (d *DNSServer) preparedQueryLookup(network, datacenter, query string, req, resp *dns.Msg) {
+	// Execute the prepared query.
+	args := structs.PreparedQueryExecuteRequest{
+		Datacenter:    datacenter,
+		QueryIDOrName: query,
+		QueryOptions: structs.QueryOptions{
+			Token:      d.agent.config.ACLToken,
+			AllowStale: d.config.AllowStale,
+		},
+	}
+
+	// TODO (slackpad) - What's a safe limit we can set here? It seems like
+	// with dup filtering done at this level we need to get everything to
+	// match the previous behavior. We can optimize by pushing more filtering
+	// into the query execution, but for now I think we need to get the full
+	// response. We could also choose a large arbitrary number that will
+	// likely work in practice, like 10*maxUDPAnswerLimit which should help
+	// reduce bandwidth if there are thousands of nodes available.
+
+	endpoint := d.agent.getEndpoint(preparedQueryEndpoint)
+	var out structs.PreparedQueryExecuteResponse
+RPC:
+	if err := d.agent.RPC(endpoint+".Execute", &args, &out); err != nil {
+		// If they give a bogus query name, treat that as a name error,
+		// not a full on server error. We have to use a string compare
+		// here since the RPC layer loses the type information.
+		if err.Error() == consul.ErrQueryNotFound.Error() {
+			d.addSOA(d.domain, resp)
+			resp.SetRcode(req, dns.RcodeNameError)
+			return
+		}
+
+		d.logger.Printf("[ERR] dns: rpc error: %v", err)
+		resp.SetRcode(req, dns.RcodeServerFailure)
+		return
+	}
+
+	// Verify that request is not too stale, redo the request.
+	if args.AllowStale && out.LastContact > d.config.MaxStale {
+		args.AllowStale = false
+		d.logger.Printf("[WARN] dns: Query results too stale, re-requesting")
+		goto RPC
+	}
+
+	// Determine the TTL. The parse should never fail since we vet it when
+	// the query is created, but we check anyway. If the query didn't
+	// specify a TTL then we will try to use the agent's service-specific
+	// TTL configs.
+	var ttl time.Duration
+	if out.DNS.TTL != "" {
+		var err error
+		ttl, err = time.ParseDuration(out.DNS.TTL)
+		if err != nil {
+			d.logger.Printf("[WARN] dns: Failed to parse TTL '%s' for prepared query '%s', ignoring", out.DNS.TTL, query)
+		}
+	} else if d.config.ServiceTTL != nil {
+		var ok bool
+		ttl, ok = d.config.ServiceTTL[out.Service]
+		if !ok {
+			ttl = d.config.ServiceTTL["*"]
+		}
+	}
+
+	// If we have no nodes, return not found!
+	if len(out.Nodes) == 0 {
+		d.addSOA(d.domain, resp)
+		resp.SetRcode(req, dns.RcodeNameError)
+		return
+	}
+
+	// Add various responses depending on the request.
+	qType := req.Question[0].Qtype
+	d.serviceNodeRecords(datacenter, out.Nodes, req, resp, ttl)
+	if qType == dns.TypeSRV {
+		d.serviceSRVRecords(datacenter, out.Nodes, req, resp, ttl)
+	}
+
+	// If the network is not TCP, restrict the number of responses.
+	if network != "tcp" {
+		wasTrimmed := trimUDPAnswers(d.config, resp)
+
+		// Flag that there are more records to return in the UDP response
+		if wasTrimmed && d.config.EnableTruncate {
+			resp.Truncated = true
+		}
+	}
+
+	// If the answer is empty and the response isn't truncated, return not found
+	if len(resp.Answer) == 0 && !resp.Truncated {
+		d.addSOA(d.domain, resp)
+		return
 	}
 }
 
 // serviceNodeRecords is used to add the node records for a service lookup
-func (d *DNSServer) serviceNodeRecords(nodes structs.CheckServiceNodes, req, resp *dns.Msg, ttl time.Duration) {
+func (d *DNSServer) serviceNodeRecords(dc string, nodes structs.CheckServiceNodes, req, resp *dns.Msg, ttl time.Duration) {
 	qName := req.Question[0].Name
 	qType := req.Question[0].Qtype
 	handled := make(map[string]struct{})
+
 	for _, node := range nodes {
-		// Avoid duplicate entries, possible if a node has
-		// the same service on multiple ports, etc.
-		addr := node.Node.Address
+		// Start with the translated address but use the service address,
+		// if specified.
+		addr := d.translateAddr(dc, node.Node)
 		if node.Service.Address != "" {
 			addr = node.Service.Address
 		}
 
+		// Avoid duplicate entries, possible if a node has
+		// the same service on multiple ports, etc.
 		if _, ok := handled[addr]; ok {
 			continue
 		}
 		handled[addr] = struct{}{}
 
 		// Add the node record
-		records := d.formatNodeRecord(&node.Node, addr, qName, qType, ttl)
+		records := d.formatNodeRecord(node.Node, addr, qName, qType, ttl)
 		if records != nil {
 			resp.Answer = append(resp.Answer, records...)
 		}
@@ -609,14 +739,15 @@ func (d *DNSServer) serviceSRVRecords(dc string, nodes structs.CheckServiceNodes
 		}
 		resp.Answer = append(resp.Answer, srvRec)
 
-		// Determine advertised address
-		addr := node.Node.Address
+		// Start with the translated address but use the service address,
+		// if specified.
+		addr := d.translateAddr(dc, node.Node)
 		if node.Service.Address != "" {
 			addr = node.Service.Address
 		}
 
 		// Add the extra record
-		records := d.formatNodeRecord(&node.Node, addr, srvRec.Target, dns.TypeANY, ttl)
+		records := d.formatNodeRecord(node.Node, addr, srvRec.Target, dns.TypeANY, ttl)
 		if records != nil {
 			resp.Extra = append(resp.Extra, records...)
 		}
@@ -628,7 +759,9 @@ func (d *DNSServer) handleRecurse(resp dns.ResponseWriter, req *dns.Msg) {
 	q := req.Question[0]
 	network := "udp"
 	defer func(s time.Time) {
-		d.logger.Printf("[DEBUG] dns: request for %v (%s) (%v)", q, network, time.Now().Sub(s))
+		d.logger.Printf("[DEBUG] dns: request for %v (%s) (%v) from client %s (%s)",
+			q, network, time.Now().Sub(s), resp.RemoteAddr().String(),
+			resp.RemoteAddr().Network())
 	}(time.Now())
 
 	// Switch to TCP if the client is
@@ -655,7 +788,8 @@ func (d *DNSServer) handleRecurse(resp dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	// If all resolvers fail, return a SERVFAIL message
-	d.logger.Printf("[ERR] dns: all resolvers failed for %v", q)
+	d.logger.Printf("[ERR] dns: all resolvers failed for %v from client %s (%s)",
+		q, resp.RemoteAddr().String(), resp.RemoteAddr().Network())
 	m := &dns.Msg{}
 	m.SetReply(req)
 	m.RecursionAvailable = true

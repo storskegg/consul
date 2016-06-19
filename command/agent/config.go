@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/consul"
+	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/watch"
 	"github.com/mitchellh/mapstructure"
 )
@@ -26,7 +27,7 @@ type PortConfig struct {
 	HTTPS   int // HTTPS API
 	RPC     int // CLI RPC
 	SerfLan int `mapstructure:"serf_lan"` // LAN gossip (Client + Server)
-	SerfWan int `mapstructure:"serf_wan"` // WAN gossip (Server onlyg)
+	SerfWan int `mapstructure:"serf_wan"` // WAN gossip (Server only)
 	Server  int // Server internal RPC
 }
 
@@ -76,6 +77,21 @@ type DNSConfig struct {
 	// returned by default for UDP.
 	EnableTruncate bool `mapstructure:"enable_truncate"`
 
+	// UDPAnswerLimit is used to limit the maximum number of DNS Resource
+	// Records returned in the ANSWER section of a DNS response. This is
+	// not normally useful and will be limited based on the querying
+	// protocol, however systems that implemented §6 Rule 9 in RFC3484
+	// may want to set this to `1` in order to subvert §6 Rule 9 and
+	// re-obtain the effect of randomized resource records (i.e. each
+	// answer contains only one IP, but the IP changes every request).
+	// RFC3484 sorts answers in a deterministic order, which defeats the
+	// purpose of randomized DNS responses.  This RFC has been obsoleted
+	// by RFC6724 and restores the desired behavior of randomized
+	// responses, however a large number of Linux hosts using glibc(3)
+	// implemented §6 Rule 9 and may need this option (e.g. CentOS 5-6,
+	// Debian Squeeze, etc).
+	UDPAnswerLimit int `mapstructure:"udp_answer_limit"`
+
 	// MaxStale is used to bound how stale of a result is
 	// accepted for a DNS lookup. This can be used with
 	// AllowStale to limit how old of a value is served up.
@@ -90,16 +106,46 @@ type DNSConfig struct {
 	OnlyPassing bool `mapstructure:"only_passing"`
 }
 
+// Telemetry is the telemetry configuration for the server
+type Telemetry struct {
+	// StatsiteAddr is the address of a statsite instance. If provided,
+	// metrics will be streamed to that instance.
+	StatsiteAddr string `mapstructure:"statsite_address"`
+
+	// StatsdAddr is the address of a statsd instance. If provided,
+	// metrics will be sent to that instance.
+	StatsdAddr string `mapstructure:"statsd_address"`
+
+	// StatsitePrefix is the prefix used to write stats values to. By
+	// default this is set to 'consul'.
+	StatsitePrefix string `mapstructure:"statsite_prefix"`
+
+	// DisableHostname will disable hostname prefixing for all metrics
+	DisableHostname bool `mapstructure:"disable_hostname"`
+
+	// DogStatsdAddr is the address of a dogstatsd instance. If provided,
+	// metrics will be sent to that instance
+	DogStatsdAddr string `mapstructure:"dogstatsd_addr"`
+
+	// DogStatsdTags are the global tags that should be sent with each packet to dogstatsd
+	// It is a list of strings, where each string looks like "my_tag_name:my_tag_value"
+	DogStatsdTags []string `mapstructure:"dogstatsd_tags"`
+}
+
 // Config is the configuration that can be set for an Agent.
 // Some of this is configurable as CLI flags, but most must
 // be set using a configuration file.
 type Config struct {
+	// DevMode enables a fast-path mode of opertaion to bring up an in-memory
+	// server with minimal configuration. Useful for developing Consul.
+	DevMode bool `mapstructure:"-"`
+
 	// Bootstrap is used to bring up the first Consul server, and
 	// permits that node to elect itself leader
 	Bootstrap bool `mapstructure:"bootstrap"`
 
 	// BootstrapExpect tries to automatically bootstrap the Consul cluster,
-	// by witholding peers until enough servers join.
+	// by withholding peers until enough servers join.
 	BootstrapExpect int `mapstructure:"bootstrap_expect"`
 
 	// Server controls if this agent acts like a Consul server,
@@ -158,31 +204,35 @@ type Config struct {
 	// Serf WAN IP. If not specified, the general advertise address is used.
 	AdvertiseAddrWan string `mapstructure:"advertise_addr_wan"`
 
+	// TranslateWanAddrs controls whether or not Consul should prefer
+	// the "wan" tagged address when doing lookups in remote datacenters.
+	// See TaggedAddresses below for more details.
+	TranslateWanAddrs bool `mapstructure:"translate_wan_addrs"`
+
 	// Port configurations
 	Ports PortConfig
 
 	// Address configurations
 	Addresses AddressConfig
 
+	// Tagged addresses. These are used to publish a set of addresses for
+	// for a node, which can be used by the remote agent. We currently
+	// populate only the "wan" tag based on the SerfWan advertise address,
+	// but this structure is here for possible future features with other
+	// user-defined tags. The "wan" tag will be used by remote agents if
+	// they are configured with TranslateWanAddrs set to true.
+	TaggedAddresses map[string]string
+
 	// LeaveOnTerm controls if Serf does a graceful leave when receiving
 	// the TERM signal. Defaults false. This can be changed on reload.
 	LeaveOnTerm bool `mapstructure:"leave_on_terminate"`
 
-	// SkipLeaveOnInt controls if Serf skips a graceful leave when receiving
-	// the INT signal. Defaults false. This can be changed on reload.
-	SkipLeaveOnInt bool `mapstructure:"skip_leave_on_interrupt"`
+	// SkipLeaveOnInt controls if Serf skips a graceful leave when
+	// receiving the INT signal. Defaults false on clients, true on
+	// servers. This can be changed on reload.
+	SkipLeaveOnInt *bool `mapstructure:"skip_leave_on_interrupt"`
 
-	// StatsiteAddr is the address of a statsite instance. If provided,
-	// metrics will be streamed to that instance.
-	StatsiteAddr string `mapstructure:"statsite_addr"`
-
-	// StatsitePrefix is the prefix used to write stats values to. By
-	// default this is set to 'consul'.
-	StatsitePrefix string `mapstructure:"statsite_prefix"`
-
-	// StatsdAddr is the address of a statsd instance. If provided,
-	// metrics will be sent to that instance.
-	StatsdAddr string `mapstructure:"statsd_addr"`
+	Telemetry Telemetry `mapstructure:"telemetry"`
 
 	// Protocol is the Consul protocol version to use.
 	Protocol int `mapstructure:"protocol"`
@@ -221,7 +271,7 @@ type Config struct {
 	KeyFile string `mapstructure:"key_file"`
 
 	// ServerName is used with the TLS certificates to ensure the name we
-	// provid ematches the certificate
+	// provide matches the certificate
 	ServerName string `mapstructure:"server_name"`
 
 	// StartJoin is a list of addresses to attempt to join when the
@@ -261,6 +311,18 @@ type Config struct {
 	// the default is 30s.
 	RetryIntervalWan    time.Duration `mapstructure:"-" json:"-"`
 	RetryIntervalWanRaw string        `mapstructure:"retry_interval_wan"`
+
+	// ReconnectTimeout* specify the amount of time to wait to reconnect with
+	// another agent before deciding it's permanently gone. This can be used to
+	// control the time it takes to reap failed nodes from the cluster.
+	ReconnectTimeoutLan    time.Duration `mapstructure:"-"`
+	ReconnectTimeoutLanRaw string        `mapstructure:"reconnect_timeout"`
+	ReconnectTimeoutWan    time.Duration `mapstructure:"-"`
+	ReconnectTimeoutWanRaw string        `mapstructure:"reconnect_timeout_wan"`
+
+	// EnableUi enables the statically-compiled assets for the Consul web UI and
+	// serves them at the default /ui/ endpoint automatically.
+	EnableUi bool `mapstructure:"ui"`
 
 	// UiDir is the directory containing the Web UI resources.
 	// If provided, the UI endpoints will be enabled.
@@ -322,7 +384,7 @@ type Config struct {
 	//   * deny - Deny all requests
 	//   * extend-cache - Ignore the cache expiration, and allow cached
 	//                    ACL's to be used to service requests. This
-	//	                  is the default. If the ACL is not in the cache,
+	//                    is the default. If the ACL is not in the cache,
 	//                    this acts like deny.
 	ACLDownPolicy string `mapstructure:"acl_down_policy"`
 
@@ -363,10 +425,29 @@ type Config struct {
 	// to it's cluster. Requires Atlas integration.
 	AtlasJoin bool `mapstructure:"atlas_join"`
 
+	// AtlasEndpoint is the SCADA endpoint used for Atlas integration. If
+	// empty, the defaults from the provider are used.
+	AtlasEndpoint string `mapstructure:"atlas_endpoint"`
+
 	// AEInterval controls the anti-entropy interval. This is how often
-	// the agent attempts to reconcile it's local state with the server'
+	// the agent attempts to reconcile its local state with the server's
 	// representation of our state. Defaults to every 60s.
 	AEInterval time.Duration `mapstructure:"-" json:"-"`
+
+	// DisableCoordinates controls features related to network coordinates.
+	DisableCoordinates bool `mapstructure:"disable_coordinates"`
+
+	// SyncCoordinateRateTarget controls the rate for sending network
+	// coordinates to the server, in updates per second. This is the max rate
+	// that the server supports, so we scale our interval based on the size
+	// of the cluster to try to achieve this in aggregate at the server.
+	SyncCoordinateRateTarget float64 `mapstructure:"-" json:"-"`
+
+	// SyncCoordinateIntervalMin sets the minimum interval that coordinates
+	// will be sent to the server. We scale the interval based on the cluster
+	// size, but below a certain interval it doesn't make sense send them any
+	// faster.
+	SyncCoordinateIntervalMin time.Duration `mapstructure:"-" json:"-"`
 
 	// Checks holds the provided check definitions
 	Checks []*CheckDefinition `mapstructure:"-" json:"-"`
@@ -395,6 +476,17 @@ type Config struct {
 	// Minimum Session TTL
 	SessionTTLMin    time.Duration `mapstructure:"-"`
 	SessionTTLMinRaw string        `mapstructure:"session_ttl_min"`
+
+	// Reap controls automatic reaping of child processes, useful if running
+	// as PID 1 in a Docker container. This defaults to nil which will make
+	// Consul reap only if it detects it's running as PID 1. If non-nil,
+	// then this will be used to decide if reaping is enabled.
+	Reap *bool `mapstructure:"reap"`
+}
+
+// Bool is used to initialize bool pointers in struct literals.
+func Bool(b bool) *bool {
+	return &b
 }
 
 // UnixSocketPermissions contains information about a unix socket, and
@@ -415,6 +507,10 @@ func (u UnixSocketPermissions) Group() string {
 
 func (u UnixSocketPermissions) Mode() string {
 	return u.Perms
+}
+
+func (s *Telemetry) GoString() string {
+	return fmt.Sprintf("*%#v", *s)
 }
 
 // UnixSocketConfig stores information about various unix sockets which
@@ -455,19 +551,44 @@ func DefaultConfig() *Config {
 			Server:  8300,
 		},
 		DNSConfig: DNSConfig{
-			MaxStale: 5 * time.Second,
+			UDPAnswerLimit: 3,
+			MaxStale:       5 * time.Second,
 		},
-		StatsitePrefix:      "consul",
+		Telemetry: Telemetry{
+			StatsitePrefix: "consul",
+		},
 		SyslogFacility:      "LOCAL0",
-		Protocol:            consul.ProtocolVersionMax,
+		Protocol:            consul.ProtocolVersion2Compatible,
 		CheckUpdateInterval: 5 * time.Minute,
 		AEInterval:          time.Minute,
-		ACLTTL:              30 * time.Second,
-		ACLDownPolicy:       "extend-cache",
-		ACLDefaultPolicy:    "allow",
-		RetryInterval:       30 * time.Second,
-		RetryIntervalWan:    30 * time.Second,
+		DisableCoordinates:  false,
+
+		// SyncCoordinateRateTarget is set based on the rate that we want
+		// the server to handle as an aggregate across the entire cluster.
+		// If you update this, you'll need to adjust CoordinateUpdate* in
+		// the server-side config accordingly.
+		SyncCoordinateRateTarget:  64.0, // updates / second
+		SyncCoordinateIntervalMin: 15 * time.Second,
+
+		ACLTTL:           30 * time.Second,
+		ACLDownPolicy:    "extend-cache",
+		ACLDefaultPolicy: "allow",
+		RetryInterval:    30 * time.Second,
+		RetryIntervalWan: 30 * time.Second,
 	}
+}
+
+// DevConfig is used to return a set of configuration to use for dev mode.
+func DevConfig() *Config {
+	conf := DefaultConfig()
+	conf.DevMode = true
+	conf.LogLevel = "DEBUG"
+	conf.Server = true
+	conf.EnableDebug = true
+	conf.DisableAnonymousSignature = true
+	conf.EnableUi = true
+	conf.BindAddr = "127.0.0.1"
+	return conf
 }
 
 // EncryptBytes returns the encryption key configured.
@@ -545,6 +666,30 @@ func DecodeConfig(r io.Reader) (*Config, error) {
 			}
 			result.Checks = append(result.Checks, check)
 		}
+
+		// A little hacky but upgrades the old stats config directives to the new way
+		if sub, ok := obj["statsd_addr"]; ok && result.Telemetry.StatsdAddr == "" {
+			result.Telemetry.StatsdAddr = sub.(string)
+		}
+
+		if sub, ok := obj["statsite_addr"]; ok && result.Telemetry.StatsiteAddr == "" {
+			result.Telemetry.StatsiteAddr = sub.(string)
+		}
+
+		if sub, ok := obj["statsite_prefix"]; ok && result.Telemetry.StatsitePrefix == "" {
+			result.Telemetry.StatsitePrefix = sub.(string)
+		}
+
+		if sub, ok := obj["dogstatsd_addr"]; ok && result.Telemetry.DogStatsdAddr == "" {
+			result.Telemetry.DogStatsdAddr = sub.(string)
+		}
+
+		if sub, ok := obj["dogstatsd_tags"].([]interface{}); ok && len(result.Telemetry.DogStatsdTags) == 0 {
+			result.Telemetry.DogStatsdTags = make([]string, len(sub))
+			for i := range sub {
+				result.Telemetry.DogStatsdTags[i] = sub[i].(string)
+			}
+		}
 	}
 
 	// Decode
@@ -564,10 +709,14 @@ func DecodeConfig(r io.Reader) (*Config, error) {
 	// Check unused fields and verify that no bad configuration options were
 	// passed to Consul. There are a few additional fields which don't directly
 	// use mapstructure decoding, so we need to account for those as well.
-	allowedKeys := []string{"service", "services", "check", "checks"}
+	allowedKeys := []string{
+		"service", "services", "check", "checks", "statsd_addr", "statsite_addr", "statsite_prefix",
+		"dogstatsd_addr", "dogstatsd_tags",
+	}
+
 	var unused []string
 	for _, field := range md.Unused {
-		if !strContains(allowedKeys, field) {
+		if !lib.StrContains(allowedKeys, field) {
 			unused = append(unused, field)
 		}
 	}
@@ -635,6 +784,28 @@ func DecodeConfig(r io.Reader) (*Config, error) {
 			return nil, fmt.Errorf("RetryIntervalWan invalid: %v", err)
 		}
 		result.RetryIntervalWan = dur
+	}
+
+	const reconnectTimeoutMin = 8 * time.Hour
+	if raw := result.ReconnectTimeoutLanRaw; raw != "" {
+		dur, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("ReconnectTimeoutLan invalid: %v", err)
+		}
+		if dur < reconnectTimeoutMin {
+			return nil, fmt.Errorf("ReconnectTimeoutLan must be >= %s", reconnectTimeoutMin.String())
+		}
+		result.ReconnectTimeoutLan = dur
+	}
+	if raw := result.ReconnectTimeoutWanRaw; raw != "" {
+		dur, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("ReconnectTimeoutWan invalid: %v", err)
+		}
+		if dur < reconnectTimeoutMin {
+			return nil, fmt.Errorf("ReconnectTimeoutWan must be >= %s", reconnectTimeoutMin.String())
+		}
+		result.ReconnectTimeoutWan = dur
 	}
 
 	// Merge the single recursor
@@ -745,6 +916,9 @@ func FixupCheckType(raw interface{}) error {
 		case "service_id":
 			rawMap["serviceid"] = v
 			delete(rawMap, "service_id")
+		case "docker_container_id":
+			rawMap["DockerContainerID"] = v
+			delete(rawMap, "docker_container_id")
 		}
 	}
 
@@ -855,6 +1029,9 @@ func MergeConfig(a, b *Config) *Config {
 	if b.AdvertiseAddrWan != "" {
 		result.AdvertiseAddrWan = b.AdvertiseAddrWan
 	}
+	if b.TranslateWanAddrs == true {
+		result.TranslateWanAddrs = true
+	}
 	if b.AdvertiseAddrs.SerfLan != nil {
 		result.AdvertiseAddrs.SerfLan = b.AdvertiseAddrs.SerfLan
 		result.AdvertiseAddrs.SerfLanRaw = b.AdvertiseAddrs.SerfLanRaw
@@ -873,17 +1050,26 @@ func MergeConfig(a, b *Config) *Config {
 	if b.LeaveOnTerm == true {
 		result.LeaveOnTerm = true
 	}
-	if b.SkipLeaveOnInt == true {
-		result.SkipLeaveOnInt = true
+	if b.SkipLeaveOnInt != nil {
+		result.SkipLeaveOnInt = b.SkipLeaveOnInt
 	}
-	if b.StatsiteAddr != "" {
-		result.StatsiteAddr = b.StatsiteAddr
+	if b.Telemetry.DisableHostname == true {
+		result.Telemetry.DisableHostname = true
 	}
-	if b.StatsitePrefix != "" {
-		result.StatsitePrefix = b.StatsitePrefix
+	if b.Telemetry.StatsdAddr != "" {
+		result.Telemetry.StatsdAddr = b.Telemetry.StatsdAddr
 	}
-	if b.StatsdAddr != "" {
-		result.StatsdAddr = b.StatsdAddr
+	if b.Telemetry.StatsiteAddr != "" {
+		result.Telemetry.StatsiteAddr = b.Telemetry.StatsiteAddr
+	}
+	if b.Telemetry.StatsitePrefix != "" {
+		result.Telemetry.StatsitePrefix = b.Telemetry.StatsitePrefix
+	}
+	if b.Telemetry.DogStatsdAddr != "" {
+		result.Telemetry.DogStatsdAddr = b.Telemetry.DogStatsdAddr
+	}
+	if b.Telemetry.DogStatsdTags != nil {
+		result.Telemetry.DogStatsdTags = b.Telemetry.DogStatsdTags
 	}
 	if b.EnableDebug {
 		result.EnableDebug = true
@@ -948,6 +1134,9 @@ func MergeConfig(a, b *Config) *Config {
 	if b.Addresses.RPC != "" {
 		result.Addresses.RPC = b.Addresses.RPC
 	}
+	if b.EnableUi {
+		result.EnableUi = true
+	}
 	if b.UiDir != "" {
 		result.UiDir = b.UiDir
 	}
@@ -972,6 +1161,14 @@ func MergeConfig(a, b *Config) *Config {
 	if b.RetryIntervalWan != 0 {
 		result.RetryIntervalWan = b.RetryIntervalWan
 	}
+	if b.ReconnectTimeoutLan != 0 {
+		result.ReconnectTimeoutLan = b.ReconnectTimeoutLan
+		result.ReconnectTimeoutLanRaw = b.ReconnectTimeoutLanRaw
+	}
+	if b.ReconnectTimeoutWan != 0 {
+		result.ReconnectTimeoutWan = b.ReconnectTimeoutWan
+		result.ReconnectTimeoutWanRaw = b.ReconnectTimeoutWanRaw
+	}
 	if b.DNSConfig.NodeTTL != 0 {
 		result.DNSConfig.NodeTTL = b.DNSConfig.NodeTTL
 	}
@@ -985,6 +1182,9 @@ func MergeConfig(a, b *Config) *Config {
 	}
 	if b.DNSConfig.AllowStale {
 		result.DNSConfig.AllowStale = true
+	}
+	if b.DNSConfig.UDPAnswerLimit != 0 {
+		result.DNSConfig.UDPAnswerLimit = b.DNSConfig.UDPAnswerLimit
 	}
 	if b.DNSConfig.EnableTruncate {
 		result.DNSConfig.EnableTruncate = true
@@ -1056,6 +1256,12 @@ func MergeConfig(a, b *Config) *Config {
 	if b.AtlasJoin {
 		result.AtlasJoin = true
 	}
+	if b.AtlasEndpoint != "" {
+		result.AtlasEndpoint = b.AtlasEndpoint
+	}
+	if b.DisableCoordinates {
+		result.DisableCoordinates = true
+	}
 	if b.SessionTTLMinRaw != "" {
 		result.SessionTTLMin = b.SessionTTLMin
 		result.SessionTTLMinRaw = b.SessionTTLMinRaw
@@ -1088,6 +1294,10 @@ func MergeConfig(a, b *Config) *Config {
 	result.RetryJoinWan = make([]string, 0, len(a.RetryJoinWan)+len(b.RetryJoinWan))
 	result.RetryJoinWan = append(result.RetryJoinWan, a.RetryJoinWan...)
 	result.RetryJoinWan = append(result.RetryJoinWan, b.RetryJoinWan...)
+
+	if b.Reap != nil {
+		result.Reap = b.Reap
+	}
 
 	return &result
 }
@@ -1139,6 +1349,10 @@ func ReadConfigPaths(paths []string) (*Config, error) {
 
 			// If it isn't a JSON file, ignore it
 			if !strings.HasSuffix(fi.Name(), ".json") {
+				continue
+			}
+			// If the config file is empty, ignore it
+			if fi.Size() == 0 {
 				continue
 			}
 
